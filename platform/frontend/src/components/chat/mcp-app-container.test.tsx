@@ -1,6 +1,6 @@
-import { act, render, screen } from "@testing-library/react";
+import { act, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { useEffect } from "react";
+import { type ReactNode, useEffect } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // ── Mock heavy dependencies before module import ─────────────────────────────
@@ -36,6 +36,12 @@ vi.mock("next-themes", () => ({
   useTheme: () => ({ resolvedTheme: "light" }),
 }));
 
+vi.mock("next/link", () => ({
+  default: ({ children, href }: { children: ReactNode; href: string }) => (
+    <a href={href}>{children}</a>
+  ),
+}));
+
 vi.mock("@/lib/config/config", () => ({
   getMcpSandboxBaseUrl: () => ({
     baseUrl: "http://127.0.0.1:9000",
@@ -47,10 +53,40 @@ vi.mock("@/lib/config/config.query", () => ({
   useFeature: () => null,
 }));
 
+// Avoid pulling the real auth client / app query (and their network deps) into
+// the test; the edit pencil is covered by app-frame.test.tsx.
+vi.mock("@/lib/auth/auth.query", () => ({
+  useHasPermissions: () => ({ data: false }),
+}));
+
+vi.mock("@/lib/app.query", () => ({
+  useApp: vi.fn(() => ({ data: undefined })),
+}));
+
+// Stub the inline settings form: it pulls the environment/teams/auth query
+// chains, which aren't this suite's concern (covered by their own tests). Here
+// we only assert the panel chrome toggles it from the gear.
+vi.mock("@/components/mcp-app/app-settings-form", () => ({
+  AppSettingsForm: ({ onBack }: { onBack: () => void }) => (
+    <div data-testid="settings-form">
+      <button type="button" onClick={onBack}>
+        mock back
+      </button>
+    </div>
+  ),
+}));
+
 // ── Import component under test after mocks ───────────────────────────────────
 
+import { useApp } from "@/lib/app.query";
+import {
+  clearAllAppDiagnostics,
+  reportAppDiagnostic,
+} from "@/lib/chat/app-diagnostics-store";
+import { AppsProvider, useApps } from "./apps-context";
 import { McpAppSection } from "./mcp-app-container";
-import { PinnedCanvasProvider, usePinnedCanvas } from "./pinned-canvas-context";
+
+const mockUseApp = vi.mocked(useApp);
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -174,6 +210,28 @@ describe("McpAppSection", () => {
 
     expect(document.querySelector("iframe")).toBeInTheDocument();
   });
+
+  it("titles an owned app from the live query, not the captured appName prop", async () => {
+    // After an edit invalidates the app query, the address bar must reflect the
+    // new name even though the appName prop was captured at render time.
+    mockUseApp.mockReturnValue({
+      data: { name: "Renamed Dashboard" },
+    } as ReturnType<typeof useApp>);
+
+    await act(async () => {
+      render(
+        <McpAppSection
+          {...defaultProps}
+          appId="11111111-1111-1111-1111-111111111111"
+          appName="Stale Dashboard"
+          preloadedResource={preloadedResource}
+        />,
+      );
+    });
+
+    expect(screen.getByText("Renamed Dashboard")).toBeInTheDocument();
+    expect(screen.queryByText("Stale Dashboard")).not.toBeInTheDocument();
+  });
 });
 
 describe("McpAppContainer (via McpAppSection)", () => {
@@ -279,9 +337,9 @@ describe("McpAppContainer inline height (via McpAppSection)", () => {
     vi.clearAllMocks();
   });
 
-  // Drives the canvas into the sidebar portal so renderInSidebar becomes true.
-  function SidebarDriver({ target }: { target: HTMLElement }) {
-    const { setPortalTarget, select } = usePinnedCanvas();
+  // Drives the app into the panel portal so renderInPanel becomes true.
+  function PanelDriver({ target }: { target: HTMLElement }) {
+    const { setPortalTarget, select } = useApps();
     useEffect(() => {
       setPortalTarget(target);
       select("tc1");
@@ -294,7 +352,7 @@ describe("McpAppContainer inline height (via McpAppSection)", () => {
   // proxy is a true process boundary, so faking its ready message is legitimate.
   async function renderReadyApp(
     viewportHeight: number,
-    { sidebar = false }: { sidebar?: boolean } = {},
+    { panel = false }: { panel?: boolean } = {},
   ) {
     Object.defineProperty(window, "innerHeight", {
       value: viewportHeight,
@@ -335,18 +393,24 @@ describe("McpAppContainer inline height (via McpAppSection)", () => {
 
     await act(async () => {
       render(
-        sidebar ? (
-          <PinnedCanvasProvider
-            conversationId="conv-1"
-            canvases={[{ toolCallId: "tc1", label: "app", createdAt: 0 }]}
+        panel ? (
+          <AppsProvider
+            apps={[
+              {
+                toolCallId: "tc1",
+                label: "app",
+                uiResourceUri: defaultProps.uiResourceUri,
+                createdAt: 0,
+              },
+            ]}
           >
-            <SidebarDriver target={document.body} />
+            <PanelDriver target={document.body} />
             <McpAppSection
               {...defaultProps}
               toolCallId="tc1"
               preloadedResource={preloadedResource}
             />
-          </PinnedCanvasProvider>
+          </AppsProvider>
         ) : (
           <McpAppSection
             {...defaultProps}
@@ -376,12 +440,10 @@ describe("McpAppContainer inline height (via McpAppSection)", () => {
     return bridge;
   }
 
-  function inlineMaxHeightPx(): number {
-    const el = Array.from(document.querySelectorAll<HTMLElement>("*")).find(
-      (e) => e.style.maxHeight !== "",
-    );
-    if (!el) throw new Error("no element carries a max-height style");
-    return Number.parseFloat(el.style.maxHeight);
+  function inlineIframeHeightPx(): number {
+    const iframe = document.querySelector("iframe");
+    if (!iframe) throw new Error("iframe did not mount");
+    return Number.parseFloat(iframe.style.height);
   }
 
   // biome-ignore lint/suspicious/noExplicitAny: reading mock call args
@@ -390,37 +452,366 @@ describe("McpAppContainer inline height (via McpAppSection)", () => {
     return calls[calls.length - 1]?.[0]?.containerDimensions;
   }
 
-  it("caps the inline card at a viewport fraction, well above the legacy 500px", async () => {
+  it("grows the inline app to its reported height", async () => {
     const bridge = await renderReadyApp(2000);
 
     await act(async () => {
       bridge.onsizechange({ height: 700 });
     });
 
-    expect(inlineMaxHeightPx()).toBe(700);
-    expect(inlineMaxHeightPx()).not.toBe(500);
+    expect(inlineIframeHeightPx()).toBe(700);
   });
 
-  it("clamps a report taller than the ceiling to the ceiling", async () => {
+  it("caps an oversized inline report at the card's visual ceiling", async () => {
+    // innerHeight 2000 → ceiling max(320px, 60vh) = 1200. A viewport-relative
+    // app that reports an ever-growing height is clamped here so the iframe
+    // can't inflate without bound (content scrolls within it instead).
     const bridge = await renderReadyApp(2000);
 
     await act(async () => {
       bridge.onsizechange({ height: 100_000 });
     });
 
-    // ceiling = round(2000 * 0.6) = 1200
-    expect(inlineMaxHeightPx()).toBe(1200);
+    expect(inlineIframeHeightPx()).toBe(1200);
   });
 
-  it("hints the viewport ceiling to the guest, not the legacy 500px", async () => {
+  it("hints the inline ceiling to the guest", async () => {
+    // innerHeight 2000 → 60vh = 1200. The host shares this honest ceiling so a
+    // cooperative app can lay out within it.
     const bridge = await renderReadyApp(2000);
-    // ceiling = round(2000 * 0.6) = 1200
     expect(lastGuestContainerDimensions(bridge)).toEqual({ maxHeight: 1200 });
   });
 
-  it("hints no cap to the guest when the canvas fills the sidebar", async () => {
-    const bridge = await renderReadyApp(2000, { sidebar: true });
+  it("hints no cap to the guest when the app fills the panel", async () => {
+    const bridge = await renderReadyApp(2000, { panel: true });
     expect(lastGuestContainerDimensions(bridge)).toEqual({});
+  });
+});
+
+describe("McpAppSection panel hosting", () => {
+  const APP_ID = "947051c7-ea8e-48ed-8077-a3cc904d9d61";
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    clearAllAppDiagnostics();
+  });
+
+  // Opens the panel app host (portalTarget) so the selected owned-app section
+  // portals its iframe into the target.
+  function PanelHost({ target }: { target: HTMLElement }) {
+    const { setPortalTarget } = useApps();
+    useEffect(() => {
+      setPortalTarget(target);
+    }, [setPortalTarget, target]);
+    return null;
+  }
+
+  it("hosts an owned-app render in the panel app host", async () => {
+    const target = document.createElement("div");
+    document.body.appendChild(target);
+
+    await act(async () => {
+      render(
+        <AppsProvider
+          apps={[
+            {
+              toolCallId: "tc1",
+              label: "To Do App",
+              uiResourceUri: defaultProps.uiResourceUri,
+              createdAt: 0,
+            },
+          ]}
+        >
+          <PanelHost target={target} />
+          <McpAppSection
+            {...defaultProps}
+            appId={APP_ID}
+            toolCallId="tc1"
+            preloadedResource={preloadedResource}
+          />
+        </AppsProvider>,
+      );
+    });
+
+    // Opening the app host auto-selects the sole app, portaling the live
+    // owned-app iframe into the panel target (not left inline).
+    expect(target.querySelector("iframe")).toBeInTheDocument();
+    expect(screen.getByText(/showing in panel/i)).toBeInTheDocument();
+
+    target.remove();
+  });
+
+  it("keeps the diagnostics badge out of the stretched app wrapper when hosted", async () => {
+    // The error badge must not share the fill-container wrapper with the iframe:
+    // that wrapper applies `[&>div]:!h-full`, so a badge inside it gets stretched
+    // to full height and shoves the iframe below the panel fold (blank render).
+    reportAppDiagnostic(APP_ID, 1, {
+      type: "csp-violation",
+      message: "script-src blocked eval",
+    });
+    const target = document.createElement("div");
+    document.body.appendChild(target);
+
+    await act(async () => {
+      render(
+        <AppsProvider
+          apps={[
+            {
+              toolCallId: "tc1",
+              label: "To Do App",
+              uiResourceUri: defaultProps.uiResourceUri,
+              createdAt: 0,
+            },
+          ]}
+        >
+          <PanelHost target={target} />
+          <McpAppSection
+            {...defaultProps}
+            appId={APP_ID}
+            toolCallId="tc1"
+            preloadedResource={preloadedResource}
+          />
+        </AppsProvider>,
+      );
+    });
+
+    const iframe = target.querySelector("iframe");
+    expect(iframe).toBeInTheDocument();
+    const badge = within(target).getByText(/runtime error/i);
+
+    // The nearest overflow-hidden wrapper of the iframe is the fill-container
+    // clip box that stretches its `> div` children; the badge must sit OUTSIDE
+    // it, or it gets sized to full height and pushes the iframe off-screen.
+    let clipWrapper: HTMLElement | null = iframe?.parentElement ?? null;
+    while (
+      clipWrapper &&
+      clipWrapper !== target &&
+      !clipWrapper.className.includes("overflow-hidden")
+    ) {
+      clipWrapper = clipWrapper.parentElement;
+    }
+    expect(clipWrapper).not.toBeNull();
+    expect(clipWrapper?.contains(badge)).toBe(false);
+
+    target.remove();
+  });
+
+  it("keeps a second, unselected app live inline while the panel hosts another", async () => {
+    const user = userEvent.setup();
+    const target = document.createElement("div");
+    document.body.appendChild(target);
+
+    await act(async () => {
+      render(
+        // tc1 is the latest (greatest createdAt), so it becomes the default
+        // selection and the rendered tc2 section stays unselected.
+        <AppsProvider
+          apps={[
+            {
+              toolCallId: "tc1",
+              label: "First App",
+              uiResourceUri: "resource://test-server/ui-other",
+              createdAt: 1,
+            },
+            {
+              toolCallId: "tc2",
+              label: "Second App",
+              uiResourceUri: defaultProps.uiResourceUri,
+              createdAt: 0,
+            },
+          ]}
+        >
+          <PanelHost target={target} />
+          <McpAppSection
+            {...defaultProps}
+            appId={APP_ID}
+            toolCallId="tc2"
+            preloadedResource={preloadedResource}
+          />
+        </AppsProvider>,
+      );
+    });
+
+    // tc1 is auto-selected and hosted in the panel. The unselected tc2 keeps
+    // rendering live inline (not a placeholder) and is NOT shown in the panel,
+    // while still offering its own Show in panel control.
+    const showButton = screen.getByRole("button", { name: /show in panel/i });
+    expect(target.querySelector("iframe")).not.toBeInTheDocument();
+    expect(screen.queryByText(/showing in panel/i)).not.toBeInTheDocument();
+    // tc2's live iframe renders inline (in the document, outside the panel target).
+    expect(document.querySelector("iframe")).toBeInTheDocument();
+
+    // Clicking it selects tc2 and portals its iframe into the panel target.
+    await act(async () => {
+      await user.click(showButton);
+    });
+
+    expect(target.querySelector("iframe")).toBeInTheDocument();
+    expect(screen.getByText(/showing in panel/i)).toBeInTheDocument();
+
+    target.remove();
+  });
+});
+
+describe("McpAppSection superseded renders", () => {
+  const APP_ID = "947051c7-ea8e-48ed-8077-a3cc904d9d61";
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("collapses to a changelog pill when a newer render of the same app exists", async () => {
+    await act(async () => {
+      render(
+        // Registry's latest render of APP_ID is tc2, so the tc1 section below is
+        // superseded and must render the static pill, not a live iframe.
+        <AppsProvider
+          apps={[
+            {
+              toolCallId: "tc2",
+              label: "Dashboard",
+              uiResourceUri: defaultProps.uiResourceUri,
+              appId: APP_ID,
+              createdAt: 1,
+            },
+          ]}
+        >
+          <McpAppSection
+            {...defaultProps}
+            appId={APP_ID}
+            appName="Dashboard"
+            appVersion={1}
+            toolName="archestra__edit_app"
+            toolCallId="tc1"
+            preloadedResource={preloadedResource}
+          />
+        </AppsProvider>,
+      );
+    });
+
+    expect(screen.getByText(/Dashboard · v1 · Updated/)).toBeInTheDocument();
+    expect(document.querySelector("iframe")).not.toBeInTheDocument();
+  });
+
+  it("renders the live surface for the latest render of an app", async () => {
+    await act(async () => {
+      render(
+        <AppsProvider
+          apps={[
+            {
+              toolCallId: "tc1",
+              label: "Dashboard",
+              uiResourceUri: defaultProps.uiResourceUri,
+              appId: APP_ID,
+              createdAt: 0,
+            },
+          ]}
+        >
+          <McpAppSection
+            {...defaultProps}
+            appId={APP_ID}
+            appName="Dashboard"
+            appVersion={1}
+            toolName="archestra__edit_app"
+            toolCallId="tc1"
+            preloadedResource={preloadedResource}
+          />
+        </AppsProvider>,
+      );
+    });
+
+    expect(document.querySelector("iframe")).toBeInTheDocument();
+    expect(screen.queryByText(/· Updated/)).not.toBeInTheDocument();
+  });
+});
+
+describe("McpAppSection owned-app panel chrome", () => {
+  const APP_ID = "947051c7-ea8e-48ed-8077-a3cc904d9d61";
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    clearAllAppDiagnostics();
+  });
+
+  function PanelHost({ target }: { target: HTMLElement }) {
+    const { setPortalTarget } = useApps();
+    useEffect(() => {
+      setPortalTarget(target);
+    }, [setPortalTarget, target]);
+    return null;
+  }
+
+  // Renders an owned app selected into the panel host so the tabbed chrome
+  // branch (renderInPanel && appId && ownedApp) is active. The live card portals
+  // into `target`.
+  async function renderOwnedPanel() {
+    mockUseApp.mockReturnValue({
+      data: { id: APP_ID, name: "To Do App" },
+    } as ReturnType<typeof useApp>);
+    const target = document.createElement("div");
+    document.body.appendChild(target);
+    await act(async () => {
+      render(
+        <AppsProvider
+          apps={[
+            {
+              toolCallId: "tc1",
+              label: "To Do App",
+              uiResourceUri: defaultProps.uiResourceUri,
+              createdAt: 0,
+            },
+          ]}
+        >
+          <PanelHost target={target} />
+          <McpAppSection
+            {...defaultProps}
+            appId={APP_ID}
+            toolCallId="tc1"
+            preloadedResource={preloadedResource}
+          />
+        </AppsProvider>,
+      );
+    });
+    return target;
+  }
+
+  it("toggles the inline settings form from the panel gear", async () => {
+    const user = userEvent.setup();
+    const target = await renderOwnedPanel();
+
+    // Chrome shows a single settings gear (no dropdown / publish popover) over
+    // the live app.
+    const gear = within(target).getByRole("button", { name: /app settings/i });
+    expect(target.querySelector("iframe")).toBeInTheDocument();
+    expect(
+      within(target).queryByTestId("settings-form"),
+    ).not.toBeInTheDocument();
+
+    // Clicking it swaps the body for the settings form (live iframe unmounts).
+    await act(async () => {
+      await user.click(gear);
+    });
+    expect(within(target).getByTestId("settings-form")).toBeInTheDocument();
+    expect(target.querySelector("iframe")).not.toBeInTheDocument();
+
+    // In settings mode the bar shows a back arrow (cancel) and a save action;
+    // clicking back returns to the live app and restores the gear.
+    expect(
+      within(target).getByRole("button", { name: /save settings/i }),
+    ).toBeInTheDocument();
+    await act(async () => {
+      await user.click(
+        within(target).getByRole("button", { name: /back to app/i }),
+      );
+    });
+    expect(
+      within(target).queryByTestId("settings-form"),
+    ).not.toBeInTheDocument();
+    expect(
+      within(target).getByRole("button", { name: /app settings/i }),
+    ).toBeInTheDocument();
+
+    target.remove();
   });
 });
 

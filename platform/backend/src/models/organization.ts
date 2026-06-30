@@ -30,6 +30,14 @@ class OrganizationModel {
   }
 
   /**
+   * The deployment's display name for user-facing copy, honoring enterprise
+   * white-labeling. Falls back to "Archestra" when unset.
+   */
+  static async getAppName(): Promise<string> {
+    return (await OrganizationModel.getFirst())?.appName || "Archestra";
+  }
+
+  /**
    * Get or create the default organization
    */
   static async getOrCreateDefaultOrganization(): Promise<Organization> {
@@ -218,24 +226,6 @@ class OrganizationModel {
       "OrganizationModel.getById: completed",
     );
     return organization || null;
-  }
-
-  /**
-   * Whether the org allows search_tools/run_tool to discover and auto-assign
-   * catalog tools beyond the agent's assigned set. Lean read on the tool
-   * dispatch path; intentionally not cached so admin toggles affect the next
-   * discovery/dispatch call. Defaults to true when the organization is missing.
-   */
-  static async getAllowToolAutoAssignment(id: string): Promise<boolean> {
-    const [organization] = await db
-      .select({
-        allowToolAutoAssignment:
-          schema.organizationsTable.allowToolAutoAssignment,
-      })
-      .from(schema.organizationsTable)
-      .where(eq(schema.organizationsTable.id, id))
-      .limit(1);
-    return organization?.allowToolAutoAssignment ?? true;
   }
 
   /**

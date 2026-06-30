@@ -3,6 +3,8 @@ import {
   type PaginationQuery,
   PLAYWRIGHT_MCP_CATALOG_ID,
   parseFullToolName,
+  providerRequiresPerUserCredential,
+  type SupportedProvider,
   TOOL_QUERY_KNOWLEDGE_SOURCES_SHORT_NAME,
   urlSlugify,
 } from "@archestra/shared";
@@ -32,6 +34,7 @@ import {
   type PaginatedResult,
 } from "@/database/utils/pagination";
 import logger from "@/logging";
+import { isSkillSandboxAvailableForAgent } from "@/skills/skill-sandbox-availability";
 import type {
   Agent,
   AgentScope,
@@ -42,6 +45,7 @@ import type {
   UpdateAgent,
 } from "@/types";
 import { isUniqueConstraintError } from "@/utils/db";
+import { isUuid } from "@/utils/uuid";
 import AgentConnectorAssignmentModel from "./agent-connector-assignment";
 import AgentKnowledgeBaseModel from "./agent-knowledge-base";
 import AgentLabelModel from "./agent-label";
@@ -182,6 +186,97 @@ class AgentModel {
   }
 
   /**
+   * Resolve each agent's configured LLM provider server-side so every viewer
+   * sees the agent's true provider — even one who can't access the owner's
+   * per-user key. Provider comes from the attached key, falling back to the
+   * pinned model's provider when only a model is set.
+   */
+  private static async populateResolvedLlm(agents: Agent[]): Promise<void> {
+    if (agents.length === 0) return;
+
+    const apiKeyIds = [
+      ...new Set(
+        agents
+          .map((a) => a.llmApiKeyId)
+          .filter((id): id is string => id !== null),
+      ),
+    ];
+    const modelIds = [
+      ...new Set(
+        agents.map((a) => a.modelId).filter((id): id is string => id !== null),
+      ),
+    ];
+
+    const [keyRows, modelRows] = await Promise.all([
+      apiKeyIds.length > 0
+        ? db
+            .select({
+              id: schema.llmProviderApiKeysTable.id,
+              provider: schema.llmProviderApiKeysTable.provider,
+            })
+            .from(schema.llmProviderApiKeysTable)
+            .where(inArray(schema.llmProviderApiKeysTable.id, apiKeyIds))
+        : Promise.resolve([]),
+      modelIds.length > 0
+        ? db
+            .select({
+              id: schema.modelsTable.id,
+              provider: schema.modelsTable.provider,
+              // The human-facing model identifier (e.g. "gpt-4"), distinct from
+              // the row's UUID `id`.
+              modelName: schema.modelsTable.modelId,
+            })
+            .from(schema.modelsTable)
+            .where(inArray(schema.modelsTable.id, modelIds))
+        : Promise.resolve([]),
+    ]);
+
+    const keyProviderMap = new Map(keyRows.map((r) => [r.id, r.provider]));
+    const modelProviderMap = new Map(modelRows.map((r) => [r.id, r.provider]));
+    const modelNameMap = new Map(modelRows.map((r) => [r.id, r.modelName]));
+
+    for (const agent of agents) {
+      const provider: SupportedProvider | null =
+        (agent.llmApiKeyId ? keyProviderMap.get(agent.llmApiKeyId) : null) ??
+        (agent.modelId ? modelProviderMap.get(agent.modelId) : null) ??
+        null;
+      agent.resolvedLlmProvider = provider;
+      agent.llmProviderRequiresPerUserCredential = provider
+        ? providerRequiresPerUserCredential(provider)
+        : false;
+      // The model's human name, so a viewer who can't access the configured
+      // key still sees "gpt-4" rather than the model row's UUID.
+      agent.resolvedLlmModelName = agent.modelId
+        ? (modelNameMap.get(agent.modelId) ?? null)
+        : null;
+    }
+  }
+
+  /**
+   * Populate `sandboxAvailable` per agent for the requesting user. No-op without
+   * a userId (system/background callers): the field stays absent and clients
+   * treat that as unavailable. `isSkillSandboxAvailableForAgent` short-circuits
+   * cheaply when the sandbox feature is off, so this is near-free in the common
+   * case; the per-agent permission/tool lookups only run when it is enabled.
+   */
+  private static async populateSandboxAvailability(
+    agents: Agent[],
+    userId: string | undefined,
+  ): Promise<void> {
+    if (agents.length === 0 || !userId) return;
+
+    await Promise.all(
+      agents.map(async (agent) => {
+        agent.sandboxAvailable = await isSkillSandboxAvailableForAgent({
+          userId,
+          organizationId: agent.organizationId,
+          agentId: agent.id,
+        });
+      }),
+    );
+  }
+
+  /**
    * Populate connectorIds on agents via batch lookup from the junction table.
    */
   private static async populateConnectorIds(agents: Agent[]): Promise<void> {
@@ -214,6 +309,13 @@ class AgentModel {
         .from(schema.organizationsTable)
         .limit(1);
       organizationId = firstOrg?.id || "";
+    }
+
+    // Dynamic tool access only works through the search/run dispatch surface, so
+    // an all-tools agent must use progressive loading. Coerce here so every
+    // create path (UI, MCP tools, REST, import, clone) keeps the invariant.
+    if (agent.accessAllTools === true) {
+      agent.toolExposureMode = "search_and_run_only";
     }
 
     const slug =
@@ -274,6 +376,10 @@ class AgentModel {
     // Auto-assign the MCP App management tools when the apps feature is
     // enabled, so new agents can build and use apps without per-agent setup.
     await ToolModel.assignAppToolsToAgent(createdAgent.id, organizationId);
+
+    // Auto-assign the code-execution sandbox + Projects file tools based on the
+    // runtime/Projects flags, so new agents can use them without manual setup.
+    await ToolModel.assignSandboxToolsToAgent(createdAgent.id, organizationId);
 
     // Get team details and tools for the created agent
     const [teamDetails, assignedTools] = await Promise.all([
@@ -435,6 +541,7 @@ class AgentModel {
       AgentModel.populateKnowledgeBaseIds(agents),
       AgentModel.populateConnectorIds(agents),
       AgentModel.populateSuggestedPrompts(agents),
+      AgentModel.populateResolvedLlm(agents),
     ]);
     AgentModel.filterUnavailableKnowledgeTools(agents);
 
@@ -516,6 +623,7 @@ class AgentModel {
       connectorIds: connectorMap.get(agent.id) || [],
       suggestedPrompts: suggestedPromptsMap.get(agent.id) || [],
     }));
+    await AgentModel.populateResolvedLlm(results);
     AgentModel.filterUnavailableKnowledgeTools(results);
 
     return results;
@@ -602,6 +710,7 @@ class AgentModel {
       connectorIds: connectorMap.get(agent.id) || [],
       suggestedPrompts: suggestedPromptsMap.get(agent.id) || [],
     }));
+    await AgentModel.populateResolvedLlm(results);
     AgentModel.filterUnavailableKnowledgeTools(results);
 
     return results;
@@ -813,8 +922,20 @@ class AgentModel {
       }
     }
 
-    // Apply access control filtering for non-agent admins
-    if (userId && !isAgentAdmin) {
+    // Access-control filtering. Non-admins are always restricted to the agents
+    // they can access (own personal + org + teams they belong to). An admin is
+    // restricted the same way ONLY in the default active "All" view (no explicit
+    // scope), so it shows just what they can access rather than the whole org —
+    // oversight (other users' personal agents and team agents for teams they
+    // aren't in) is dropped there. Explicit scopes keep the admin's full
+    // org-wide base (oversight stays reachable via Team → pick that team and
+    // Personal → Other users), and so does the admin-only deleted view, whose
+    // whole purpose is reviewing every removed agent.
+    const isDefaultActiveAllView =
+      filters?.scope === undefined &&
+      (filters?.status ?? "active") !== "deleted";
+    const restrictToAccessible = !isAgentAdmin || isDefaultActiveAllView;
+    if (userId && restrictToAccessible) {
       const accessibleAgentIds = await AgentTeamModel.getUserAccessibleAgentIds(
         userId,
         false,
@@ -1023,6 +1144,7 @@ class AgentModel {
       AgentModel.populateKnowledgeBaseIds(agents),
       AgentModel.populateConnectorIds(agents),
       AgentModel.populateSuggestedPrompts(agents),
+      AgentModel.populateResolvedLlm(agents),
     ]);
     AgentModel.filterUnavailableKnowledgeTools(agents);
 
@@ -1128,6 +1250,16 @@ class AgentModel {
     return result?.organizationId ?? null;
   }
 
+  static async findEnvironmentId(id: string): Promise<string | null> {
+    const [result] = await db
+      .select({ environmentId: schema.agentsTable.environmentId })
+      .from(schema.agentsTable)
+      .where(and(eq(schema.agentsTable.id, id), notDeleted(schema.agentsTable)))
+      .limit(1);
+
+    return result?.environmentId ?? null;
+  }
+
   static async findIdentityProviderId(id: string): Promise<string | null> {
     const [result] = await db
       .select({ identityProviderId: schema.agentsTable.identityProviderId })
@@ -1136,6 +1268,23 @@ class AgentModel {
       .limit(1);
 
     return result?.identityProviderId ?? null;
+  }
+
+  /**
+   * Whether the agent's "access all tools" toggle is on — the per-agent opt-in
+   * for dynamic tool access via search_tools/run_tool. Lean read on the tool
+   * dispatch path; intentionally not cached so toggling the setting affects
+   * the next discovery/dispatch call. Defaults to false when the agent is
+   * missing or deleted.
+   */
+  static async getAccessAllTools(id: string): Promise<boolean> {
+    const [result] = await db
+      .select({ accessAllTools: schema.agentsTable.accessAllTools })
+      .from(schema.agentsTable)
+      .where(and(eq(schema.agentsTable.id, id), notDeleted(schema.agentsTable)))
+      .limit(1);
+
+    return result?.accessAllTools ?? false;
   }
 
   static async findIdsByOrganizationId(
@@ -1373,10 +1522,47 @@ class AgentModel {
     await Promise.all([
       AgentModel.populateAuthorNames([result]),
       AgentModel.populateSuggestedPrompts([result]),
+      AgentModel.populateResolvedLlm([result]),
+      AgentModel.populateSandboxAvailability([result], userId),
     ]);
     AgentModel.filterUnavailableKnowledgeTools([result]);
 
     return result;
+  }
+
+  /**
+   * Minimal agent lookup for opening a conversation: the SAME access gate as
+   * {@link findById}, but selecting only the LLM-selection fields that path uses
+   * (`llmApiKeyId`, `modelId`). Skips the tool join and the
+   * team/label/knowledge/connector/author/prompt/resolved-LLM hydration that
+   * dominate `findById`'s cost and are unused when creating a conversation.
+   */
+  static async findLlmSelectionFieldsById(
+    id: string,
+    userId?: string,
+    isAgentAdmin?: boolean,
+  ): Promise<{ llmApiKeyId: string | null; modelId: string | null } | null> {
+    if (userId && !isAgentAdmin) {
+      const hasAccess = await AgentTeamModel.userHasAgentAccess(
+        userId,
+        id,
+        false,
+      );
+      if (!hasAccess) {
+        return null;
+      }
+    }
+
+    const rows = await db
+      .select({
+        llmApiKeyId: schema.agentsTable.llmApiKeyId,
+        modelId: schema.agentsTable.modelId,
+      })
+      .from(schema.agentsTable)
+      .where(and(eq(schema.agentsTable.id, id), notDeleted(schema.agentsTable)))
+      .limit(1);
+
+    return rows[0] ?? null;
   }
 
   static async findDeletedByIdForOrganization(
@@ -1431,6 +1617,7 @@ class AgentModel {
     await Promise.all([
       AgentModel.populateAuthorNames([result]),
       AgentModel.populateSuggestedPrompts([result]),
+      AgentModel.populateResolvedLlm([result]),
     ]);
 
     return result;
@@ -1496,6 +1683,34 @@ class AgentModel {
     AgentModel.filterUnavailableKnowledgeTools([result]);
 
     return result;
+  }
+
+  /**
+   * The org's default agent of a given type (`isDefault = true`), if one exists.
+   * Used as the implicit fallback when a caller cannot pick an agent — e.g. a
+   * user without `agent:read` creating a scheduled task. Returns id-level
+   * metadata only; null when the org has no default of that type.
+   */
+  static async findDefaultByType(params: {
+    organizationId: string;
+    agentType: AgentType;
+  }): Promise<{ id: string; agentType: AgentType } | null> {
+    const [row] = await db
+      .select({
+        id: schema.agentsTable.id,
+        agentType: schema.agentsTable.agentType,
+      })
+      .from(schema.agentsTable)
+      .where(
+        and(
+          eq(schema.agentsTable.organizationId, params.organizationId),
+          eq(schema.agentsTable.agentType, params.agentType),
+          eq(schema.agentsTable.isDefault, true),
+          notDeleted(schema.agentsTable),
+        ),
+      )
+      .limit(1);
+    return row ?? null;
   }
 
   private static async getOrCreateDefaultByType(
@@ -1602,6 +1817,21 @@ class AgentModel {
       return null;
     }
 
+    // Keep the all-tools ⇒ progressive-loading invariant on every update path:
+    // if the agent's effective accessAllTools is on, force search_and_run_only.
+    // Only mutate when there is an actual inconsistency to fix, so unrelated
+    // updates don't spuriously rewrite the exposure mode.
+    const effectiveAccessAllTools =
+      agent.accessAllTools ?? existingAgent.accessAllTools;
+    const effectiveToolExposureMode =
+      agent.toolExposureMode ?? existingAgent.toolExposureMode;
+    if (
+      effectiveAccessAllTools &&
+      effectiveToolExposureMode !== "search_and_run_only"
+    ) {
+      agent.toolExposureMode = "search_and_run_only";
+    }
+
     // If setting isDefault to true, unset isDefault for other agents of the same type
     if (agent.isDefault === true) {
       await db
@@ -1640,6 +1870,19 @@ class AgentModel {
         for (const parentAgentId of parentAgentIds) {
           clearChatMcpClient(parentAgentId);
         }
+      }
+
+      // The advertised tool surface depends on toolExposureMode (full vs the
+      // search_tools/run_tool dispatch surface) and accessAllTools. A cached
+      // chat MCP client freezes that surface at connection-build time, so a
+      // change here must evict the client — otherwise switching an agent to
+      // "all tools" / search_and_run_only doesn't expose run_tool/search_tools
+      // until the connection is rebuilt for some unrelated reason.
+      if (
+        updatedAgent.toolExposureMode !== existingAgent.toolExposureMode ||
+        updatedAgent.accessAllTools !== existingAgent.accessAllTools
+      ) {
+        clearChatMcpClient(id);
       }
     } else {
       updatedAgent = existingAgent;
@@ -1887,6 +2130,13 @@ class AgentModel {
         agentType: "agent",
         scope: "personal",
         description: "Your personal chat assistant",
+        // The personal assistant should be able to reach every tool the user
+        // can access (e.g. MCP servers they install) without per-tool
+        // assignment. `accessAllTools` grants that dynamic access and, via the
+        // invariant in AgentModel.create, coerces toolExposureMode to
+        // "search_and_run_only" so the search_tools/run_tool dispatch surface
+        // is exposed.
+        accessAllTools: true,
       },
       userId,
     );
@@ -2251,18 +2501,22 @@ class AgentModel {
    * Checks both the id and slug columns in a single query.
    */
   static async resolveIdFromIdOrSlug(idOrSlug: string): Promise<string | null> {
+    // `agents.id` is a uuid column. Casting it to text (`id::text = $1`) so it
+    // can be compared against a possibly-non-uuid slug defeats the primary-key
+    // index and forces a sequential scan. Instead, only compare against `id`
+    // when the input is itself a valid uuid (letting Postgres use the PK index),
+    // and otherwise rely solely on the indexed `slug` lookup.
+    const matchesIdOrSlug = isUuid(idOrSlug)
+      ? or(
+          eq(schema.agentsTable.id, idOrSlug),
+          eq(schema.agentsTable.slug, idOrSlug),
+        )
+      : eq(schema.agentsTable.slug, idOrSlug);
+
     const [row] = await db
       .select({ id: schema.agentsTable.id })
       .from(schema.agentsTable)
-      .where(
-        and(
-          or(
-            sql`${schema.agentsTable.id}::text = ${idOrSlug}`,
-            eq(schema.agentsTable.slug, idOrSlug),
-          ),
-          notDeleted(schema.agentsTable),
-        ),
-      )
+      .where(and(matchesIdOrSlug, notDeleted(schema.agentsTable)))
       .limit(1);
 
     return row?.id ?? null;
@@ -2304,6 +2558,7 @@ class AgentModel {
           description: sourceAgent.description,
           icon: sourceAgent.icon,
           toolExposureMode: sourceAgent.toolExposureMode,
+          accessAllTools: sourceAgent.accessAllTools,
           considerContextUntrusted: sourceAgent.considerContextUntrusted,
           incomingEmailEnabled: sourceAgent.incomingEmailEnabled,
           incomingEmailSecurityMode: sourceAgent.incomingEmailSecurityMode,
@@ -2428,6 +2683,7 @@ class AgentModel {
       isDefault: row.isDefault,
       llmModel: row.llmModel ?? null,
       toolExposureMode: row.toolExposureMode,
+      accessAllTools: row.accessAllTools,
       tools: tools.map((t) => t.name).sort(),
       knowledgeBaseIds: [...knowledgeBaseIds].sort(),
       connectorIds: [...connectorIds].sort(),

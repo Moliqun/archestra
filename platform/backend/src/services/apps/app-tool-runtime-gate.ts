@@ -9,12 +9,13 @@ import {
 import type { McpUiToolMeta } from "@modelcontextprotocol/ext-apps";
 import { archestraMcpBranding } from "@/archestra-mcp-server/branding";
 import {
+  AppModel,
   OrganizationModel,
   TeamModel,
   ToolInvocationPolicyModel,
   ToolModel,
 } from "@/models";
-import type { GlobalToolPolicy } from "@/types";
+import type { DiscoveredToolPolicy, GlobalToolPolicy } from "@/types";
 
 /**
  * The App Data Store tools are the ONLY Archestra built-ins an app runtime may
@@ -100,6 +101,27 @@ export async function gateAppToolCall(params: {
     };
   }
 
+  // Environment fence: a tool whose catalog left the app's bound environment is
+  // refused at call time even though its assignment row remains
+  // (re-binding an app does not strip assignments). Reuses the same predicate as
+  // the assignment fence so the two never diverge. Only upstream tools reach
+  // here — app-runtime built-ins returned above are environment-less.
+  const app = await AppModel.findById(appId);
+  if (!app) {
+    return {
+      allowed: false,
+      code: -32601,
+      reason: `App "${appId}" not found.`,
+    };
+  }
+  if (!(await ToolModel.isToolInEnvironment(tool.id, app.environmentId))) {
+    return {
+      allowed: false,
+      code: -32601,
+      reason: `Tool "${toolName}" is not available in the app's environment.`,
+    };
+  }
+
   const visibility = (tool.meta as { _meta?: { ui?: McpUiToolMeta } } | null)
     ?._meta?.ui?.visibility;
   if (visibility && !visibility.includes("app")) {
@@ -116,6 +138,11 @@ export async function gateAppToolCall(params: {
   const organization = await OrganizationModel.getById(organizationId);
   const globalToolPolicy: GlobalToolPolicy =
     organization?.globalToolPolicy ?? "permissive";
+  // App tools are catalog tools, never discovered llm-proxy tools, so the
+  // discovered-tool policy never governs them — pass the org value through for
+  // signature completeness.
+  const discoveredToolPolicy: DiscoveredToolPolicy =
+    organization?.discoveredToolPolicy ?? "relaxed";
   // The viewer is the principal executing the call (as the app owner, with the
   // viewer's credentials), so a team-scoped policy is matched against the
   // viewer's teams — not an empty set, which would silently miss them.
@@ -127,6 +154,7 @@ export async function gateAppToolCall(params: {
     policyContext,
     params.isContextTrusted,
     globalToolPolicy,
+    discoveredToolPolicy,
   );
   if (!verdict.isAllowed) {
     return {
@@ -143,6 +171,7 @@ export async function gateAppToolCall(params: {
         toolInput,
         policyContext,
         globalToolPolicy,
+        discoveredToolPolicy,
       );
     if (requiresApproval) {
       return {

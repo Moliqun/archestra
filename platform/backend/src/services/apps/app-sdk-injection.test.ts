@@ -9,6 +9,8 @@ import {
   TOOL_APP_LLM_COMPLETE_SHORT_NAME,
 } from "@archestra/shared";
 import { describe, expect, test } from "vitest";
+import { buildPlatformCspContent } from "./app-sdk-injection";
+import { APP_PLATFORM_CSP } from "./app-ui-policy";
 
 // The injectAppSdk envelope logic moved to the app_runtime_core Rust crate; its
 // behavior (anchor selection, escaping, injection order) is covered by that
@@ -74,5 +76,72 @@ describe("the Apps SDK static file", () => {
     expect(sdk).toContain("__ARCHESTRA_APP_CONTEXT__");
     expect(sdk).toContain("auth_required");
     expect(sdk).toContain("auth_expired");
+  });
+
+  // The SDK also reads the bundle URL from the bootstrap context, so a foreign
+  // host that never runs the sandbox proxy can still load it.
+  test("prefers the context-provided guest SDK URL", () => {
+    expect(sdk).toContain("context.sdkUrl");
+  });
+});
+
+// The sandbox proxy injects a securitypolicyviolation listener into every guest
+// to surface runtime CSP problems. The ext-apps bundle probes code-gen support
+// with a caught `new Function("")`, which still fires a (benign) violation, so
+// the listener mutes it. Owned apps carry their SDK URL in the backend envelope
+// and never receive the `window.__ARCHESTRA_APP_SDK_URL__` global the proxy only
+// sets for external apps — so the mute must key off the platform asset path, not
+// that global, which leaked a phantom "1 runtime error" on every owned render.
+describe("the sandbox proxy CSP violation filter", () => {
+  const proxy = readFileSync(
+    join(__dirname, "../../static/mcp-sandbox-proxy.html"),
+    "utf-8",
+  );
+
+  test("mutes the platform SDK probe by asset path (owned + external apps)", () => {
+    expect(proxy).toContain('indexOf("/_sandbox/ext-apps-app.js")');
+    expect(proxy).toContain('indexOf("/_sandbox/archestra-app-sdk.js")');
+  });
+
+  test("does not gate the mute on the external-only SDK-URL global", () => {
+    expect(proxy).not.toContain(
+      "e.sourceFile === window.__ARCHESTRA_APP_SDK_URL__",
+    );
+  });
+});
+
+describe("buildPlatformCspContent", () => {
+  test("pins the platform sandbox with absolute, origin-rooted asset URLs", () => {
+    const csp = buildPlatformCspContent(
+      "https://app.example.com",
+      APP_PLATFORM_CSP,
+    );
+    expect(csp).toContain("default-src 'none'");
+    expect(csp).toContain("connect-src 'none'");
+    expect(csp).toContain("form-action 'none'");
+    expect(csp).toContain("base-uri 'none'");
+    // Both platform scripts are allowed from the absolute origin.
+    expect(csp).toContain("https://app.example.com/_sandbox/ext-apps-app.js");
+    expect(csp).toContain(
+      "https://app.example.com/_sandbox/archestra-app-sdk.js",
+    );
+    // The CDN allowlist feeds the resource directives.
+    expect(csp).toContain("cdn.jsdelivr.net");
+  });
+
+  test("drops the platform asset URLs in self-contained mode", () => {
+    const csp = buildPlatformCspContent(
+      "https://app.example.com",
+      APP_PLATFORM_CSP,
+      { selfContained: true },
+    );
+    // The SDK and stylesheet are inline ('unsafe-inline' covers them), so the
+    // resource makes no cross-origin subresource request a strict host refuses.
+    expect(csp).not.toContain("/_sandbox/ext-apps-app.js");
+    expect(csp).not.toContain("/_sandbox/archestra-app-sdk.js");
+    // The hardening directives still hold.
+    expect(csp).toContain("default-src 'none'");
+    expect(csp).toContain("connect-src 'none'");
+    expect(csp).toContain("base-uri 'none'");
   });
 });

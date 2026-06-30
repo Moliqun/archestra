@@ -1,5 +1,7 @@
 import type { archestraApiTypes } from "@archestra/shared";
-import { Loader2, ShieldX } from "lucide-react";
+import { Check, Loader2, ShieldAlert, ShieldX } from "lucide-react";
+import { useState } from "react";
+import type { UseFormReturn } from "react-hook-form";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -7,7 +9,13 @@ import {
   DialogFooter,
   DialogStickyFooter,
 } from "@/components/ui/dialog";
-import { useUpdateInternalMcpCatalogItem } from "@/lib/mcp/internal-mcp-catalog.query";
+import { useHasPermissions } from "@/lib/auth/auth.query";
+import {
+  getCatalogMutationErrorCode,
+  REMOTE_SERVER_URL_NOT_ALLOWED_CODE,
+  useApproveCatalogItemImage,
+  useUpdateInternalMcpCatalogItem,
+} from "@/lib/mcp/internal-mcp-catalog.query";
 import { useMcpServers } from "@/lib/mcp/mcp-server.query";
 import { useCanModifyCatalogItem } from "./catalog-edit-access";
 import { McpCatalogForm } from "./mcp-catalog-form";
@@ -82,23 +90,56 @@ export function EditCatalogContent({
     useCanModifyCatalogItem(item);
   const updateMutation = useUpdateInternalMcpCatalogItem();
 
+  // Image-approval banner: an admin reviews this config and approves the
+  // untrusted image here (the registry card sends them here via "Review config").
+  const { data: isInstallAdmin } = useHasPermissions({
+    mcpServerInstallation: ["admin"],
+  });
+  const approveImage = useApproveCatalogItemImage();
+  const [approvedNow, setApprovedNow] = useState(false);
+  const showApproveBanner =
+    !!isInstallAdmin && item.imageApprovalRequired === true && !approvedNow;
+
   const { data: servers = [] } = useMcpServers();
   const affectedServerCount = servers.filter(
     (s) => s.catalogId === item.id,
   ).length;
 
-  const onSubmit = async (values: McpCatalogFormValues) => {
+  const onSubmit = (
+    values: McpCatalogFormValues,
+    form: UseFormReturn<McpCatalogFormValues>,
+  ) => {
     const { multitenant: _multitenant, ...updateData } =
       transformFormToApiData(values);
 
-    await updateMutation.mutateAsync({
-      id: item.id,
-      data: updateData,
-    });
-
-    if (!keepOpenOnSave) {
-      onClose();
-    }
+    // Callback form so the dialog only closes on success; on a validation
+    // error it stays open for correction.
+    updateMutation.mutate(
+      { id: item.id, data: updateData },
+      {
+        onSuccess: () => {
+          if (!keepOpenOnSave) {
+            onClose();
+          }
+        },
+        onError: (error) => {
+          // Network-policy rejections point at the Server URL — show them
+          // inline on that field rather than as a toast.
+          if (
+            getCatalogMutationErrorCode(error) ===
+            REMOTE_SERVER_URL_NOT_ALLOWED_CODE
+          ) {
+            form.setError("serverUrl", {
+              type: "server",
+              message:
+                error instanceof Error
+                  ? error.message
+                  : "Server URL is not allowed by the environment's network policy.",
+            });
+          }
+        },
+      },
+    );
   };
 
   if (canEditLoading) {
@@ -109,40 +150,69 @@ export function EditCatalogContent({
   }
 
   return (
-    <McpCatalogForm
-      mode="edit"
-      initialValues={item}
-      onSubmit={onSubmit}
-      embedded={keepOpenOnSave}
-      nameDisabled
-      onDirtyChange={onDirtyChange}
-      submitRef={submitRef}
-      affectedServerCount={affectedServerCount}
-      footer={({ isDirty, onReset, hasBlockingErrors }) => {
-        if (keepOpenOnSave && !isDirty) return null;
-        const Footer = keepOpenOnSave ? DialogStickyFooter : DialogFooter;
-        return (
-          <Footer className={keepOpenOnSave ? "mt-0" : undefined}>
-            {keepOpenOnSave ? (
-              <Button variant="outline" onClick={onReset} type="button">
-                Discard changes
-              </Button>
-            ) : (
-              <Button variant="outline" onClick={onClose} type="button">
-                Cancel
-              </Button>
-            )}
+    <>
+      {showApproveBanner && (
+        <div className="px-6 pt-6 pb-2">
+          <div className="space-y-2 rounded-md border border-amber-500/40 bg-amber-500/5 p-3">
+            <div className="flex items-center gap-2 text-sm font-medium text-amber-600 dark:text-amber-500">
+              <ShieldAlert className="h-4 w-4" />
+              This image needs approval
+            </div>
+            <p className="text-xs text-muted-foreground">
+              <span className="font-mono">{item.localConfig?.dockerImage}</span>{" "}
+              is not in the trusted image registries for this environment.
+              Review the configuration below, then approve to allow installs.
+            </p>
             <Button
-              type="submit"
-              disabled={
-                updateMutation.isPending || !isDirty || hasBlockingErrors
+              size="sm"
+              onClick={() =>
+                approveImage.mutate(item.id, {
+                  onSuccess: () => setApprovedNow(true),
+                })
               }
+              disabled={approveImage.isPending}
             >
-              {updateMutation.isPending ? "Saving..." : "Save Changes"}
+              <Check className="h-4 w-4" />
+              {approveImage.isPending ? "Approving..." : "Approve"}
             </Button>
-          </Footer>
-        );
-      }}
-    />
+          </div>
+        </div>
+      )}
+      <McpCatalogForm
+        mode="edit"
+        initialValues={item}
+        onSubmit={onSubmit}
+        embedded={keepOpenOnSave}
+        nameDisabled
+        onDirtyChange={onDirtyChange}
+        submitRef={submitRef}
+        affectedServerCount={affectedServerCount}
+        footer={({ isDirty, onReset, hasBlockingErrors }) => {
+          if (keepOpenOnSave && !isDirty) return null;
+          const Footer = keepOpenOnSave ? DialogStickyFooter : DialogFooter;
+          return (
+            <Footer className={keepOpenOnSave ? "mt-0" : undefined}>
+              {keepOpenOnSave ? (
+                <Button variant="outline" onClick={onReset} type="button">
+                  Discard changes
+                </Button>
+              ) : (
+                <Button variant="outline" onClick={onClose} type="button">
+                  Cancel
+                </Button>
+              )}
+              <Button
+                type="submit"
+                disabled={
+                  updateMutation.isPending || !isDirty || hasBlockingErrors
+                }
+              >
+                {updateMutation.isPending ? "Saving..." : "Save Changes"}
+              </Button>
+            </Footer>
+          );
+        }}
+      />
+    </>
   );
 }

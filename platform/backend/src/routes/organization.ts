@@ -1,8 +1,11 @@
+// This file contains Enterprise regions licensed under LICENSE_ENTERPRISE.
 import {
   AUTO_PROVISIONED_INVITATION_STATUS,
   addNomicTaskPrefix,
   isModelSelectionComplete,
+  providerRequiresPerUserCredential,
   RouteId,
+  type SupportedProvider,
 } from "@archestra/shared";
 import { and, eq, inArray, like } from "drizzle-orm";
 import type { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
@@ -38,6 +41,7 @@ import {
   constructResponseSchema,
   type NetworkPolicy,
   SelectOrganizationSchema,
+  type TrustedImageRegistries,
   UpdateAgentSettingsSchema,
   UpdateAppearanceSettingsSchema,
   UpdateAuthSettingsSchema,
@@ -94,6 +98,9 @@ const organizationRoutes: FastifyPluginAsyncZod = async (fastify) => {
         throw new ApiError(404, "Organization not found");
       }
 
+      // SPDX-SnippetBegin
+      // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+      // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
       if (
         config.enterpriseFeatures.fullWhiteLabeling &&
         (body.appName !== undefined || body.iconLogo !== undefined)
@@ -119,6 +126,7 @@ const organizationRoutes: FastifyPluginAsyncZod = async (fastify) => {
           await syncBuiltInSkillsForOrganization(organization);
         }
       }
+      // SPDX-SnippetEnd
 
       return reply.send(organization);
     },
@@ -153,31 +161,14 @@ const organizationRoutes: FastifyPluginAsyncZod = async (fastify) => {
       schema: {
         operationId: RouteId.UpdateLlmSettings,
         description:
-          "Update LLM settings (TOON compression, compression scope, default user limit)",
+          "Update LLM settings (TOON compression, compression scope)",
         tags: ["Organization"],
         body: UpdateLlmSettingsSchema,
         response: constructResponseSchema(SelectOrganizationSchema),
       },
     },
     async ({ organizationId, body }, reply) => {
-      const normalizedBody =
-        body.defaultUserLimitValue === null
-          ? {
-              ...body,
-              defaultUserLimitModel: null,
-              defaultUserLimitCleanupInterval: null,
-            }
-          : {
-              ...body,
-              ...(body.defaultUserLimitModel?.length === 0
-                ? { defaultUserLimitModel: null }
-                : {}),
-            };
-
-      const organization = await OrganizationModel.patch(
-        organizationId,
-        normalizedBody,
-      );
+      const organization = await OrganizationModel.patch(organizationId, body);
 
       if (!organization) {
         throw new ApiError(404, "Organization not found");
@@ -323,6 +314,18 @@ const organizationRoutes: FastifyPluginAsyncZod = async (fastify) => {
               `Key "${key.name}" is for provider "${key.provider}", not "${provider}"`,
             );
           }
+          // Per-user providers (GitHub Copilot) can't back a shared default:
+          // each user connects their own account at setup time, so an admin
+          // default would be meaningless (and the connection flow would refuse
+          // to wrap someone else's personal key).
+          if (
+            providerRequiresPerUserCredential(provider as SupportedProvider)
+          ) {
+            throw new ApiError(
+              400,
+              `${provider} is per-user — each user connects their own account, so it can't be set as a default provider key for setup commands.`,
+            );
+          }
         }
       }
 
@@ -371,6 +374,7 @@ const organizationRoutes: FastifyPluginAsyncZod = async (fastify) => {
         defaultNetworkPolicy: typeof body.networkPolicy;
         defaultEnvironmentRestricted: boolean;
         defaultEnvironmentValidationRegex: string | null;
+        defaultEnvironmentTrustedImageRegistries: TrustedImageRegistries | null;
       }> = {};
       if ("name" in body) {
         data.defaultEnvironmentName = body.name ?? null;
@@ -389,6 +393,10 @@ const organizationRoutes: FastifyPluginAsyncZod = async (fastify) => {
       }
       if ("validationRegex" in body) {
         data.defaultEnvironmentValidationRegex = body.validationRegex ?? null;
+      }
+      if ("trustedImageRegistries" in body) {
+        data.defaultEnvironmentTrustedImageRegistries =
+          body.trustedImageRegistries ?? null;
       }
 
       const organization = await OrganizationModel.patch(organizationId, data);

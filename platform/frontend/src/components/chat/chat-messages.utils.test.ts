@@ -1,14 +1,19 @@
 import type { UIMessage } from "@ai-sdk/react";
 import { getArchestraToolShortName } from "@archestra/shared";
 import { describe, expect, it } from "vitest";
+import type { PanelApp } from "./apps-context";
 import {
   collectBrowserToolCallIds,
-  deriveCanvasesFromMessages,
+  deriveAppsFromMessages,
   extractFileAttachments,
   extractOwnedAppRender,
   filterOptimisticToolCalls,
+  getAppRenderVerb,
   hasTextPart,
   identifyCompactToolGroups,
+  isBlankAssistantTextPart,
+  isSupersededRender,
+  mcpToolLabel,
 } from "./chat-messages.utils";
 
 const getToolShortName = (toolName: string) =>
@@ -239,8 +244,26 @@ describe("collectBrowserToolCallIds", () => {
   });
 });
 
-describe("deriveCanvasesFromMessages", () => {
-  it("returns a canvas for a tool call whose output carries _meta.ui.resourceUri", () => {
+describe("mcpToolLabel", () => {
+  it("shows the raw server and tool name from a prefixed name", () => {
+    expect(mcpToolLabel("Archestra PM__show_board")).toBe(
+      "Archestra PM / show_board",
+    );
+  });
+
+  it("preserves the raw tool name's separators", () => {
+    expect(mcpToolLabel("weather__get_forecast")).toBe(
+      "weather / get_forecast",
+    );
+  });
+
+  it("returns a bare tool name with no server prefix unchanged", () => {
+    expect(mcpToolLabel("render_app")).toBe("render_app");
+  });
+});
+
+describe("deriveAppsFromMessages", () => {
+  it("returns an app for a tool call whose output carries _meta.ui.resourceUri", () => {
     const messages = [
       {
         id: "assistant-1",
@@ -258,17 +281,19 @@ describe("deriveCanvasesFromMessages", () => {
       },
     ] as never;
 
-    expect(deriveCanvasesFromMessages(messages, {}, getToolShortName)).toEqual([
+    expect(deriveAppsFromMessages(messages, {}, getToolShortName)).toEqual([
       {
         toolCallId: "call_1",
-        label: "show_board",
-        serverName: "pm",
+        label: "pm / show_board",
+        uiResourceUri: "ui://pm/board",
+        appId: null,
+        version: null,
         createdAt: Date.parse("2026-05-29T18:13:52.000Z"),
       },
     ]);
   });
 
-  it("returns a canvas from early UI-start data before the result arrives", () => {
+  it("returns an app from early UI-start data before the result arrives", () => {
     const messages = [
       {
         id: "assistant-1",
@@ -286,7 +311,7 @@ describe("deriveCanvasesFromMessages", () => {
     ] as never;
 
     expect(
-      deriveCanvasesFromMessages(
+      deriveAppsFromMessages(
         messages,
         {
           call_1: {
@@ -299,8 +324,10 @@ describe("deriveCanvasesFromMessages", () => {
     ).toEqual([
       {
         toolCallId: "call_1",
-        label: "show_board",
-        serverName: "pm",
+        label: "pm / show_board",
+        uiResourceUri: "ui://pm/board",
+        appId: null,
+        version: null,
         createdAt: 0,
       },
     ]);
@@ -334,22 +361,22 @@ describe("deriveCanvasesFromMessages", () => {
       },
     ] as never;
 
-    const canvases = deriveCanvasesFromMessages(messages, {}, getToolShortName);
-    expect(canvases).toHaveLength(1);
-    expect(canvases[0]).toMatchObject({
+    const apps = deriveAppsFromMessages(messages, {}, getToolShortName);
+    expect(apps).toHaveLength(1);
+    expect(apps[0]).toMatchObject({
       toolCallId: "call_1",
-      label: "show_board",
+      label: "pm / show_board",
     });
   });
 
-  it("returns a canvas labeled with the app name for an owned-app create_app result", () => {
+  it("returns an app labeled with the app name for an owned-app edit_app result", () => {
     const messages = [
       {
         id: "assistant-1",
         role: "assistant",
         parts: [
           {
-            type: "tool-archestra__create_app",
+            type: "tool-archestra__edit_app",
             toolCallId: "call_app",
             state: "output-available",
             output: {
@@ -357,6 +384,7 @@ describe("deriveCanvasesFromMessages", () => {
               structuredContent: {
                 id: "947051c7-ea8e-48ed-8077-a3cc904d9d61",
                 name: "To Do App",
+                latestVersion: 1,
               },
             },
           },
@@ -364,24 +392,120 @@ describe("deriveCanvasesFromMessages", () => {
       },
     ] as never;
 
-    expect(deriveCanvasesFromMessages(messages, {}, getToolShortName)).toEqual([
+    expect(deriveAppsFromMessages(messages, {}, getToolShortName)).toEqual([
       {
         toolCallId: "call_app",
         label: "To Do App",
-        serverName: "archestra",
+        uiResourceUri:
+          "ui://archestra-app/947051c7-ea8e-48ed-8077-a3cc904d9d61",
+        appId: "947051c7-ea8e-48ed-8077-a3cc904d9d61",
+        version: 1,
         createdAt: 0,
       },
     ]);
   });
 
-  it("ignores a foreign server's create_app result", () => {
+  it("de-dupes owned-app renders by appId, keeping the latest render and version", () => {
+    const messages = [
+      {
+        id: "assistant-1",
+        role: "assistant",
+        metadata: { createdAt: "2026-05-29T18:00:00.000Z" },
+        parts: [
+          {
+            type: "tool-archestra__edit_app",
+            toolCallId: "call_v1",
+            state: "output-available",
+            output: {
+              structuredContent: {
+                id: "947051c7-ea8e-48ed-8077-a3cc904d9d61",
+                name: "To Do App",
+                latestVersion: 1,
+              },
+            },
+          },
+        ],
+      },
+      {
+        id: "assistant-2",
+        role: "assistant",
+        metadata: { createdAt: "2026-05-29T18:05:00.000Z" },
+        parts: [
+          {
+            type: "tool-archestra__edit_app",
+            toolCallId: "call_v3",
+            state: "output-available",
+            output: {
+              structuredContent: {
+                id: "947051c7-ea8e-48ed-8077-a3cc904d9d61",
+                name: "To Do App",
+                latestVersion: 3,
+              },
+            },
+          },
+        ],
+      },
+    ] as never;
+
+    expect(deriveAppsFromMessages(messages, {}, getToolShortName)).toEqual([
+      {
+        toolCallId: "call_v3",
+        label: "To Do App",
+        uiResourceUri:
+          "ui://archestra-app/947051c7-ea8e-48ed-8077-a3cc904d9d61",
+        appId: "947051c7-ea8e-48ed-8077-a3cc904d9d61",
+        version: 3,
+        createdAt: Date.parse("2026-05-29T18:05:00.000Z"),
+      },
+    ]);
+  });
+
+  it("keeps distinct owned apps as separate entries", () => {
     const messages = [
       {
         id: "assistant-1",
         role: "assistant",
         parts: [
           {
-            type: "tool-other__create_app",
+            type: "tool-archestra__edit_app",
+            toolCallId: "call_a",
+            state: "output-available",
+            output: {
+              structuredContent: {
+                id: "947051c7-ea8e-48ed-8077-a3cc904d9d61",
+                name: "App A",
+                latestVersion: 1,
+              },
+            },
+          },
+          {
+            type: "tool-archestra__edit_app",
+            toolCallId: "call_b",
+            state: "output-available",
+            output: {
+              structuredContent: {
+                id: "11111111-ea8e-48ed-8077-a3cc904d9d61",
+                name: "App B",
+                latestVersion: 1,
+              },
+            },
+          },
+        ],
+      },
+    ] as never;
+
+    const apps = deriveAppsFromMessages(messages, {}, getToolShortName);
+    expect(apps.map((a) => a.toolCallId)).toEqual(["call_a", "call_b"]);
+  });
+
+  it("ignores a foreign server's edit_app result", () => {
+    const messages = [
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [
+          {
+            type: "tool-other__edit_app",
             toolCallId: "call_foreign",
             state: "output-available",
             output: {
@@ -394,9 +518,83 @@ describe("deriveCanvasesFromMessages", () => {
       },
     ] as never;
 
-    expect(deriveCanvasesFromMessages(messages, {}, getToolShortName)).toEqual(
-      [],
-    );
+    expect(deriveAppsFromMessages(messages, {}, getToolShortName)).toEqual([]);
+  });
+
+  it("keeps every external render of the same resourceUri as its own entry", () => {
+    const messages = [
+      {
+        id: "assistant-1",
+        role: "assistant",
+        metadata: { createdAt: "2026-05-29T18:00:00.000Z" },
+        parts: [
+          {
+            type: "tool-pm__show_board",
+            toolCallId: "call_1",
+            state: "output-available",
+            output: { _meta: { ui: { resourceUri: "ui://pm/board" } } },
+          },
+        ],
+      },
+      {
+        id: "assistant-2",
+        role: "assistant",
+        metadata: { createdAt: "2026-05-29T18:05:00.000Z" },
+        parts: [
+          {
+            type: "tool-pm__show_board",
+            toolCallId: "call_2",
+            state: "output-available",
+            output: { _meta: { ui: { resourceUri: "ui://pm/board" } } },
+          },
+        ],
+      },
+    ] as never;
+
+    expect(deriveAppsFromMessages(messages, {}, getToolShortName)).toEqual([
+      {
+        toolCallId: "call_1",
+        label: "pm / show_board",
+        uiResourceUri: "ui://pm/board",
+        appId: null,
+        version: null,
+        createdAt: Date.parse("2026-05-29T18:00:00.000Z"),
+      },
+      {
+        toolCallId: "call_2",
+        label: "pm / show_board",
+        uiResourceUri: "ui://pm/board",
+        appId: null,
+        version: null,
+        createdAt: Date.parse("2026-05-29T18:05:00.000Z"),
+      },
+    ]);
+  });
+
+  it("keeps non-owned renders with distinct resourceUris as separate entries", () => {
+    const messages = [
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [
+          {
+            type: "tool-pm__show_board",
+            toolCallId: "call_a",
+            state: "output-available",
+            output: { _meta: { ui: { resourceUri: "ui://pm/board-a" } } },
+          },
+          {
+            type: "tool-pm__show_board",
+            toolCallId: "call_b",
+            state: "output-available",
+            output: { _meta: { ui: { resourceUri: "ui://pm/board-b" } } },
+          },
+        ],
+      },
+    ] as never;
+
+    const apps = deriveAppsFromMessages(messages, {}, getToolShortName);
+    expect(apps.map((a) => a.toolCallId)).toEqual(["call_a", "call_b"]);
   });
 });
 
@@ -410,8 +608,6 @@ describe("extractOwnedAppRender", () => {
   };
 
   it.each([
-    "create_app",
-    "update_app",
     "edit_app",
     "render_app",
   ])("matches archestra__%s with a UUID structuredContent.id", (shortName) => {
@@ -429,8 +625,8 @@ describe("extractOwnedAppRender", () => {
   });
 
   it.each([
-    "create_app",
     "edit_app",
+    "render_app",
   ])("matches a bare %s name (run_tool accepts bare archestra short names)", (shortName) => {
     expect(
       extractOwnedAppRender({
@@ -446,17 +642,20 @@ describe("extractOwnedAppRender", () => {
   });
 
   it.each([
-    ["foreign server prefix", "other__create_app", output],
+    ["foreign server prefix", "other__edit_app", output],
+    // scaffold_app seeds the boilerplate template — it is not a rendering tool,
+    // so the chat never mounts a canvas for it (only the first edit_app does).
+    ["non-rendering scaffold tool", "archestra__scaffold_app", output],
     ["non-rendering app tool", "archestra__list_apps", output],
     ["non-rendering delete tool", "archestra__delete_app", output],
     ["non-rendering read tool", "archestra__read_app", output],
     [
       "non-UUID id",
-      "archestra__create_app",
+      "archestra__edit_app",
       { structuredContent: { id: "not-a-uuid" } },
     ],
-    ["missing structuredContent", "archestra__create_app", { content: "ok" }],
-    ["plain string output", "archestra__create_app", "Created app"],
+    ["missing structuredContent", "archestra__edit_app", { content: "ok" }],
+    ["plain string output", "archestra__edit_app", "Created app"],
   ])("returns null for %s", (_label, toolName, toolOutput) => {
     expect(
       extractOwnedAppRender({
@@ -616,5 +815,108 @@ describe("identifyCompactToolGroups", () => {
     expect(groupMap.size).toBe(2);
     expect(groupMap.get(0)?.entries).toHaveLength(1);
     expect(groupMap.get(4)?.entries).toHaveLength(1);
+  });
+});
+
+describe("isSupersededRender", () => {
+  const app = (
+    toolCallId: string,
+    uiResourceUri: string,
+    appId: string | null = "app-1",
+  ): PanelApp => ({
+    toolCallId,
+    label: "Dashboard",
+    uiResourceUri,
+    appId,
+    version: 1,
+    createdAt: 0,
+  });
+
+  it("returns false for the latest render of an owned app (registry points at it)", () => {
+    const apps = [app("tc2", "ui://app-1")];
+    expect(
+      isSupersededRender({ apps, toolCallId: "tc2", appId: "app-1" }),
+    ).toBe(false);
+  });
+
+  it("returns true for a prior owned render once a newer render registers", () => {
+    const apps = [app("tc2", "ui://app-1")];
+    expect(
+      isSupersededRender({ apps, toolCallId: "tc1", appId: "app-1" }),
+    ).toBe(true);
+  });
+
+  it("returns false when the owned app has no registry entry yet (mid-stream)", () => {
+    const apps = [app("tc9", "ui://other-app", "other-app")];
+    expect(
+      isSupersededRender({ apps, toolCallId: "tc1", appId: "app-1" }),
+    ).toBe(false);
+  });
+
+  it("never supersedes external renders sharing a resourceUri", () => {
+    // External renders carry no appId: each tool call is its own live entry,
+    // even when a sibling render holds the same resourceUri.
+    const apps = [
+      app("tc1", "ui://excalidraw", null),
+      app("tc2", "ui://excalidraw", null),
+    ];
+    expect(isSupersededRender({ apps, toolCallId: "tc1", appId: null })).toBe(
+      false,
+    );
+    expect(isSupersededRender({ apps, toolCallId: "tc2", appId: null })).toBe(
+      false,
+    );
+  });
+});
+
+describe("getAppRenderVerb", () => {
+  it("maps each app-rendering tool to its past-tense verb", () => {
+    expect(getAppRenderVerb("archestra__scaffold_app")).toBe("Created");
+    expect(getAppRenderVerb("archestra__edit_app")).toBe("Updated");
+    expect(getAppRenderVerb("archestra__render_app")).toBe("Rendered");
+  });
+
+  it("returns null for non-app tools", () => {
+    expect(getAppRenderVerb("google__search")).toBeNull();
+  });
+});
+
+describe("isBlankAssistantTextPart", () => {
+  const textPart = (text: string): UIMessage["parts"][number] => ({
+    type: "text",
+    text,
+  });
+
+  it.each([
+    " ",
+    "   ",
+    "\n\n",
+    "\t",
+    "\n  \t ",
+  ])("suppresses whitespace-only assistant text %j", (text) => {
+    expect(isBlankAssistantTextPart(textPart(text), "assistant")).toBe(true);
+  });
+
+  it("suppresses an empty-string assistant text part", () => {
+    expect(isBlankAssistantTextPart(textPart(""), "assistant")).toBe(true);
+  });
+
+  it("keeps assistant text that has real content", () => {
+    expect(isBlankAssistantTextPart(textPart("  hello  "), "assistant")).toBe(
+      false,
+    );
+  });
+
+  it("never suppresses non-assistant (user) text, even when blank", () => {
+    expect(isBlankAssistantTextPart(textPart("\n\n"), "user")).toBe(false);
+  });
+
+  it("ignores non-text parts", () => {
+    expect(
+      isBlankAssistantTextPart(
+        { type: "step-start" } as UIMessage["parts"][number],
+        "assistant",
+      ),
+    ).toBe(false);
   });
 });

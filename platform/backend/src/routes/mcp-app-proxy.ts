@@ -1,6 +1,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { RouteId } from "@archestra/shared";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { FastifyReply, FastifyRequest } from "fastify";
 import type { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
 import QuickLRU from "quick-lru";
 import { z } from "zod";
@@ -8,19 +9,35 @@ import { userHasPermission } from "@/auth/utils";
 import type { TokenAuthContext } from "@/clients/mcp-client";
 import config from "@/config";
 import { AppModel } from "@/models";
+import {
+  buildConnectorResourceUri,
+  connectorWwwAuthenticate,
+} from "@/services/apps/app-connector-resource";
 import { gateAppToolCall } from "@/services/apps/app-tool-runtime-gate";
 import { ApiError, type App, UuidIdSchema } from "@/types";
-import { createAppServer } from "./mcp-app-gateway.utils";
+import { APP_LAUNCH_TOOL_NAME } from "@/types/app";
+import {
+  createAppServer,
+  validateAppConnectorOAuthToken,
+  validateAppGatewayToken,
+} from "./mcp-app-gateway.utils";
 import {
   createStatelessTransport,
   ensureRequestSocketDestroySoon,
+  extractBearerToken,
 } from "./mcp-gateway.utils";
+import { getPublicRequestOrigin } from "./request-origin";
 
 /**
  * App-bound MCP proxy: `POST /api/mcp/app/:appId`. Carries an app's runtime
- * (ui:// HTML read + every tool call) under the browser session, both in chat
- * and on the standalone run page. `appId` is derived from the route — never from
- * the request body — so an app can only ever act as itself.
+ * (ui:// HTML read + every tool call). `appId` is derived from the route — never
+ * from the request body — so an app can only ever act as itself.
+ *
+ * Two callers: Archestra's own frontend (browser session, in chat and on the
+ * standalone run page) and external MCP clients (a `Bearer` token, validated
+ * in-route — the auth middleware skips its session check for Bearer requests to
+ * this path). The Bearer path binds the viewer from the token; both paths bind
+ * `appId` from the route, so the per-app isolation invariant holds regardless.
  */
 const mcpAppProxyRoutes: FastifyPluginAsyncZod = async (fastify) => {
   fastify.addHook("onClose", () => {
@@ -47,13 +64,59 @@ const mcpAppProxyRoutes: FastifyPluginAsyncZod = async (fastify) => {
 
       const { appId } = request.params as { appId: string };
       const body = request.body as Record<string, unknown>;
-      const userId = request.user.id;
-      const { organizationId } = request;
 
-      // Verify the session user may view this app (short-lived cache keyed by
+      // An external client presents a Bearer token — a personal token or the
+      // native OAuth flow's audience-bound token — validated here; Archestra's
+      // own frontend uses the browser session (request.user, populated by the
+      // auth middleware, which stands down only for the Bearer path). A Bearer
+      // connection builds a fresh server per request (AppServerCache is keyed by
+      // (app, user), so reuse across tokens would leak context); the session
+      // path keeps the cache.
+      const bearer = extractBearerToken(request);
+      let userId: string;
+      let organizationId: string;
+      let tokenAuth: TokenAuthContext;
+      let useServerCache: boolean;
+      let bypassAccessCache: boolean;
+      if (bearer) {
+        const auth = await resolveBearerAuth(request, appId, bearer);
+        if (!auth.ok) {
+          if (auth.kind === "challenge") {
+            // No valid token → re-issue the RFC 9728 challenge so the client can
+            // (re)discover the authorization server.
+            setConnectorChallenge(request, reply, appId);
+            return reply.status(401).send({
+              error: { message: "Unauthorized", type: "unauthorized" },
+            });
+          }
+          throw new ApiError(403, auth.message);
+        }
+        userId = auth.userId;
+        organizationId = auth.organizationId;
+        tokenAuth = auth.tokenAuth;
+        useServerCache = false;
+        bypassAccessCache = auth.bypassAccessCache;
+      } else {
+        userId = request.user.id;
+        organizationId = request.organizationId;
+        tokenAuth = {
+          tokenId: `session:${userId}`,
+          teamId: null,
+          isOrganizationToken: false,
+          isSessionAuth: true,
+          userId,
+          organizationId,
+        };
+        useServerCache = true;
+        bypassAccessCache = false;
+      }
+
+      // Verify the viewer may view this app. The OAuth path bypasses the cache so
+      // a revoked token or lost view access is denied on the next request; the
+      // session and personal-token paths keep the short-lived cache (keyed by
       // app+user+org so entries can't leak across orgs).
       const appCacheKey = `${appId}:${userId}:${organizationId}`;
-      let app = appAccessCache.get(appCacheKey);
+      let app = bypassAccessCache ? undefined : appAccessCache.get(appCacheKey);
       if (!app) {
         const isAppAdmin = await userHasPermission(
           userId,
@@ -68,22 +131,13 @@ const mcpAppProxyRoutes: FastifyPluginAsyncZod = async (fastify) => {
             userId,
             isAppAdmin,
           })) ?? undefined;
-        if (app) {
+        if (app && !bypassAccessCache) {
           appAccessCache.set(appCacheKey, app);
         }
       }
       if (!app) {
         throw new ApiError(403, "Forbidden");
       }
-
-      const sessionTokenAuth: TokenAuthContext = {
-        tokenId: `session:${userId}`,
-        teamId: null,
-        isOrganizationToken: false,
-        isSessionAuth: true,
-        userId,
-        organizationId,
-      };
 
       // Gate tools/call on the per-app allowlist + the tool's app visibility.
       // Archestra tools (the App Data Store) are exempt — they are dispatched
@@ -104,14 +158,15 @@ const mcpAppProxyRoutes: FastifyPluginAsyncZod = async (fastify) => {
       let serverHealthy = false;
       try {
         server =
-          appServerCache.acquire(appId, userId) ??
-          (await createAppServer(appId, sessionTokenAuth)).server;
+          (useServerCache
+            ? appServerCache.acquire(appId, userId)
+            : undefined) ?? (await createAppServer(appId, tokenAuth)).server;
 
         const transport = createStatelessTransport(appId);
         try {
           await server.connect(transport);
         } catch {
-          ({ server } = await createAppServer(appId, sessionTokenAuth));
+          ({ server } = await createAppServer(appId, tokenAuth));
           await server.connect(transport);
         }
         serverHealthy = true;
@@ -146,7 +201,7 @@ const mcpAppProxyRoutes: FastifyPluginAsyncZod = async (fastify) => {
           );
         }
       } finally {
-        if (server)
+        if (server && useServerCache)
           appServerCache.release(appId, userId, server, serverHealthy);
       }
     },
@@ -156,6 +211,105 @@ const mcpAppProxyRoutes: FastifyPluginAsyncZod = async (fastify) => {
 // =============================================================================
 // Internal helpers
 // =============================================================================
+
+type BearerAuth =
+  | {
+      ok: true;
+      userId: string;
+      organizationId: string;
+      tokenAuth: TokenAuthContext;
+      bypassAccessCache: boolean;
+    }
+  | { ok: false; kind: "challenge" }
+  | { ok: false; kind: "forbidden"; message: string };
+
+const NO_VIEWER_MESSAGE =
+  "App endpoints require a user-scoped token; organization/team tokens have no viewer.";
+
+/**
+ * Resolve a connector Bearer token to its viewer, or signal that the request
+ * must be challenged (no valid token) or refused (a token resolving no viewer).
+ * The token is tried as a personal token first, then as a native audience-bound
+ * OAuth token. The OAuth path bypasses the app-access cache so a revoked token or
+ * lost view access is denied on the next request.
+ */
+async function resolveBearerAuth(
+  request: FastifyRequest,
+  appId: string,
+  bearer: string,
+): Promise<BearerAuth> {
+  const personal = await validateAppGatewayToken(bearer);
+  if (personal.ok) {
+    return {
+      ok: true,
+      userId: personal.userId,
+      organizationId: personal.organizationId,
+      tokenAuth: userTokenAuthContext(personal),
+      bypassAccessCache: false,
+    };
+  }
+  if (personal.reason === "no_viewer") {
+    return { ok: false, kind: "forbidden", message: NO_VIEWER_MESSAGE };
+  }
+
+  // Not a personal/team token — try the native OAuth token, which must be
+  // audience-bound to this connector's own canonical URI.
+  const connectorResourceUri = buildConnectorResourceUri(
+    getPublicRequestOrigin(request),
+    appId,
+  );
+  if (connectorResourceUri) {
+    const oauth = await validateAppConnectorOAuthToken({
+      token: bearer,
+      appId,
+      connectorResourceUri,
+    });
+    if (oauth.ok) {
+      return {
+        ok: true,
+        userId: oauth.userId,
+        organizationId: oauth.organizationId,
+        tokenAuth: userTokenAuthContext(oauth),
+        bypassAccessCache: true,
+      };
+    }
+    if (oauth.reason === "no_viewer") {
+      return { ok: false, kind: "forbidden", message: NO_VIEWER_MESSAGE };
+    }
+  }
+  return { ok: false, kind: "challenge" };
+}
+
+function userTokenAuthContext(auth: {
+  tokenId: string;
+  userId: string;
+  organizationId: string;
+}): TokenAuthContext {
+  return {
+    tokenId: auth.tokenId,
+    teamId: null,
+    isOrganizationToken: false,
+    isUserToken: true,
+    userId: auth.userId,
+    organizationId: auth.organizationId,
+  };
+}
+
+/**
+ * Attach the RFC 9728 `WWW-Authenticate` challenge pointing at this connector's
+ * protected-resource metadata, so a client discovers the authorization server
+ * and the scope to request.
+ */
+function setConnectorChallenge(
+  request: FastifyRequest,
+  reply: FastifyReply,
+  appId: string,
+): void {
+  reply.header(
+    "WWW-Authenticate",
+    connectorWwwAuthenticate(getPublicRequestOrigin(request), appId),
+  );
+}
 
 /** Minimal reply surface the JSON-RPC gate needs — set the HTTP status to 200. */
 interface StatusReply {
@@ -199,6 +353,12 @@ async function rejectDisallowedToolCall(params: {
       -32602,
       "Invalid params: tools/call requires a string 'name' parameter",
     );
+  }
+  // The synthetic launch tool only hands back the app's own UI resource URI; it
+  // reaches no upstream tool or data store, so it bypasses the assignment gate
+  // (which would otherwise reject it as "not assigned to this app").
+  if (toolName === APP_LAUNCH_TOOL_NAME) {
+    return null;
   }
   const toolInput =
     callParams?.arguments && typeof callParams.arguments === "object"

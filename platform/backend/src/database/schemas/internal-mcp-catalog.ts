@@ -12,6 +12,7 @@ import {
 } from "drizzle-orm/pg-core";
 import type {
   AuthField,
+  CatalogItemApprovalStatus,
   EnterpriseManagedCredentialConfig,
   InternalMcpCatalogServerType,
   LocalConfig,
@@ -53,6 +54,20 @@ const internalMcpCatalogTable = pgTable(
      * one deployment per caller (default).
      */
     multitenant: boolean("multitenant").notNull().default(false),
+    /**
+     * Agent connections policy for call-time ("dynamic") credential
+     * resolution. NULL (default) = resolve at call time: each caller uses its
+     * own connection (user token → that user's install, team token → that
+     * team's install) and gets an actionable connect prompt when none exists.
+     * Set to an mcp_servers.id to pin a service account: every
+     * runtime-resolved agent call connects through that installation,
+     * regardless of the caller. Intentionally NOT a DB-level FK — mcp_servers
+     * already references this table, so the FK would create a schema import
+     * cycle; the resolver re-validates the id against the catalog's installs
+     * on every call, so a revoked connection degrades to resolve-at-call-time
+     * instead of dangling.
+     */
+    dynamicConnectionMcpServerId: uuid("dynamic_connection_mcp_server_id"),
     serverUrl: text("server_url"), // For remote servers
     docsUrl: text("docs_url"), // Documentation URL for remote servers
     clientSecretId: uuid("client_secret_id").references(() => secretTable.id, {
@@ -159,6 +174,30 @@ const internalMcpCatalogTable = pgTable(
     catalogReinstallRequired: boolean("catalog_reinstall_required")
       .notNull()
       .default(false),
+    /**
+     * Image-approval gate for PERSONAL local catalog items whose custom image is
+     * not in the target environment's trusted registries (see
+     * services/mcp-install-policy.ts). NULL = no decision recorded. `pending` is
+     * set lazily on the first blocked install attempt; an admin sets `approved`
+     * (installs proceed) or `declined` (installs blocked, with the reason).
+     * Item-level — the decision applies to the catalog item, not a specific
+     * image string. System/admin-managed only; never writable via the catalog
+     * create/edit API.
+     */
+    catalogItemApprovalStatus: text(
+      "catalog_item_approval_status",
+    ).$type<CatalogItemApprovalStatus>(),
+    /** Admin's reason when `catalog_item_approval_status = 'declined'`. */
+    catalogItemApprovalReason: text("catalog_item_approval_reason"),
+    /** User who approved/declined; set null if that user is deleted. */
+    catalogItemApprovalReviewedBy: text(
+      "catalog_item_approval_reviewed_by",
+    ).references(() => usersTable.id, { onDelete: "set null" }),
+    /** When the approve/decline decision was made. */
+    catalogItemApprovalReviewedAt: timestamp(
+      "catalog_item_approval_reviewed_at",
+      { mode: "date" },
+    ),
     createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { mode: "date" })
       .notNull()

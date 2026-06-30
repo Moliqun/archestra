@@ -18,9 +18,17 @@ Ships behind `ARCHESTRA_APPS_ENABLED` (off by default). See [Deployment](./platf
 
 ## Authoring and running
 
-Create an app from a starter template (the HTML seed) and a name. Editing the HTML forks a new immutable version; the head version is served when the app runs. Run an app standalone at `/apps/:id/run` (no chat chrome), or from chat: a successful `create_app`, `update_app`, or `render_app` call renders the app inline in the conversation. Both surfaces drive the same app-bound runtime, so behavior is identical.
+Authoring is a staged flow, each tool's result pointing at the next step: `refine_app` clarifies what to build — it asks the user up to three questions and records a spec, grounded in the MCP tools that user can actually assign — `scaffold_app` seeds the app from one opinionated starter template, `edit_app` builds up the HTML with targeted string replacements, `validate_app` checks the result (static structure plus the diagnostics from its live render), and `publish_app` promotes a personal app to a team or the organization. Editing the HTML forks a new immutable version; the head version is served when the app runs. The procedure and the SDK conventions live in the built-in **build-app** skill, not in the tool descriptions, so the model loads them on demand.
 
-While the feature is enabled, newly created agents get the app management tools (`create_app`, `update_app`, `render_app`, `list_apps`, `delete_app`) assigned by default, so "build me an app" works in chat without per-agent setup. The tools can be unassigned per agent like any other; agents created before the feature was enabled need them assigned manually.
+Run an app full-page at `/a/:id` (no chat chrome, no sidebar), author it (preview, model context, versions, name and description) at `/apps/:id`, or run it from chat: a successful `scaffold_app`, `edit_app`, or `render_app` call renders the app inline in the conversation. All surfaces drive the same app-bound runtime, so behavior is identical. Because every owned app is backed by its own MCP server, its server settings — visibility (sharing), environment, assigned tools, and deletion — are managed from its card in the [MCP registry](./platform-mcp), not the authoring page.
+
+While the feature is enabled, newly created agents get the full app tool set assigned by default — the staged flow (`refine_app`, `scaffold_app`, `read_app`, `edit_app`, `validate_app`, `publish_app`) plus the supporting `preview_app_tool`, `get_app_diagnostics`, `render_app`, `list_apps`, and `delete_app` — so "build me an app" works in chat without per-agent setup. The tools can be unassigned per agent like any other; agents created before the feature was enabled need them assigned manually.
+
+## External MCP clients
+
+An owned app is also a standalone MCP server at `POST /api/mcp/app/:id`. An external MCP client (for example a desktop MCP host) connects there with a **user (personal) token**, which resolves to a concrete viewer; organization/team tokens are rejected, because an app needs a viewer for its per-user store and RBAC. The connection binds the app from the route, so the client speaks ordinary MCP: `tools/list` exposes the app's assigned tools, its data-store tools, and an `open` tool whose result carries the app's `ui://` resource; `resources/read` returns the app's HTML. Tool calls reuse the connecting token for upstream MCP servers, exactly as in-app calls do — so an app behaves the same whether driven from Archestra or another client.
+
+To render the UI in a foreign host, the served HTML is self-contained (absolute asset URLs, host-agnostic SDK bootstrap), so a host that implements MCP-UI (`io.modelcontextprotocol/ui`) can render it; set `ARCHESTRA_API_BASE_URL` so those asset URLs resolve. The platform CSP travels with the resource as a `<meta>` tag, but a foreign host ultimately controls its own iframe — Archestra's network lockdown is enforced on Archestra's surfaces, and the [shared-app trust boundary](#shared-app-trust-boundary) applies in full when an app runs elsewhere.
 
 ## The Apps SDK
 
@@ -51,13 +59,13 @@ Write only app-specific CSS — never a full theme. The CDN allowlist is for cli
 
 ## Render diagnostics
 
-Every inline render of an owned app is observed: runtime errors (`window.onerror`, unhandled rejections, `console.error`) and CSP violations are captured from the sandbox, capped and deduplicated, and shown as an error badge on the app card. When the user sends their next chat message, the captured diagnostics are attached to it so the model can fix the app via `edit_app`/`update_app` without the user pasting errors by hand.
+Every inline render of an owned app is observed: runtime errors (`window.onerror`, unhandled rejections, `console.error`) and CSP violations are captured from the sandbox, capped and deduplicated, and shown as an error badge on the app card. When the user sends their next chat message, the captured diagnostics are attached to it so the model can fix the app via `edit_app` without the user pasting errors by hand.
 
 As a render settles, the host page also posts a snapshot (the captured entries, or an empty snapshot meaning "rendered clean") to the server, keyed per `(app, viewer)`. The `get_app_diagnostics` tool reads it back, so an authoring agent can observe a render **within the same turn** instead of waiting for the user's next message — it returns `clean`, `errors` (with the diagnostics), or `no_render_observed`, briefly waiting for the current version to render. Diagnostics originate inside the untrusted app iframe, so wherever they reach the model — the next-message attachment or the tool — they are framed strictly as data, never as instructions.
 
 ## Authoring loop
 
-The app tools form an autonomous build→render→fix loop, so an agent rarely needs the human in the middle of a build: `create_app` (or `read_app` then `edit_app` for a targeted change) → the app renders inline → `get_app_diagnostics` to see what broke → `edit_app` to fix. `read_app` returns the current stored HTML when it is not in context, and `edit_app` applies small `str_replace` edits instead of re-streaming the whole document. When app code must parse a tool's output, `preview_app_tool` runs one of the app's assigned tools server-side (as the viewer, with their credentials) and returns its real shape — but it requires human approval each call, since the tool was granted to the app, not the agent (so it is blocked outright in autonomous A2A/Slack contexts).
+The app tools form an autonomous build→render→fix loop, so an agent rarely needs the human in the middle of a build: `scaffold_app` → `edit_app` to build up the HTML → the app renders inline → `get_app_diagnostics` to see what broke → `edit_app` to fix. `read_app` returns the current stored HTML when it is not in context, and `edit_app` applies small `str_replace` edits instead of re-streaming the whole document. When app code must parse a tool's output, `preview_app_tool` runs one of the app's assigned tools server-side (as the viewer, with their credentials) and returns its real shape — but it requires human approval each call, since the tool was granted to the app, not the agent (so it is blocked outright in autonomous A2A/Slack contexts).
 
 ## App Data Store
 
@@ -65,7 +73,7 @@ Each app has its own key-to-document store, exposed to the app's HTML as `arches
 
 ## Tools and auto-auth
 
-Beyond the data store, an app can be assigned upstream MCP-server tools — from the detail page's Tools tab, or directly from chat via the `tools` parameter of `create_app`/`update_app` (declarative: the list replaces the current assignments). Assignment mirrors the agent model (scope-aligned, dynamic credentials by default). A running app can call only its assigned tools plus its own data-store tools; everything else is refused at the route.
+Beyond the data store, an app can be assigned upstream MCP-server tools — from the Tools tab of its settings in the MCP registry, or directly from chat via the `tools` parameter of `scaffold_app` (declarative: the list replaces the current assignments). Assignment mirrors the agent model (scope-aligned, dynamic credentials by default). A running app can call only its assigned tools plus its own data-store tools; everything else is refused at the route.
 
 Tool calls run **as the viewing user**: the platform resolves the MCP server and credentials per viewer at call time (personal install first, then team, then org), so an app reuses whatever MCP servers the viewer has already connected — no tokens in app code, no per-app auth setup. If the viewer hasn't connected the required server yet, `archestra.tools.call` rejects with `{ code: "auth_required", url }`; the user completes authentication in the MCP registry (apps cannot run OAuth flows themselves) and the next call succeeds.
 
@@ -79,4 +87,4 @@ A shared (team or org) app is author-written HTML executing in a viewer's browse
 
 ## Templates
 
-Curated starters seed a new app's HTML when no explicit HTML is given on create: `blank` is a minimal empty document (it leans on the injected baseline stylesheet, so it looks themed with no CSS of its own); `form` greets the viewer by name and wires a note form to the per-user data store as a working example of the SDK. Resolution is server-side — pass `templateId` to `POST /api/apps` or `create_app` and the template's HTML becomes version 1 (the id is kept as provenance). Explicit HTML always wins over a template.
+A single `default` starter seeds a new app's HTML when no explicit HTML is given on create: a themed empty state that centers the app's name, a prompt-only call to action, and a short list of what an app can build on (assigned MCP tools, the per-user and shared data store, built-in AI). It leans on the injected baseline stylesheet, so it looks themed with no full theme of its own. Resolution is server-side — `POST /api/apps` (with an optional `templateId`) or `scaffold_app` seeds the starter's HTML as version 1, substituting the app's name (the id is kept as provenance). Explicit HTML always wins over the template.

@@ -5,6 +5,7 @@ type Config = archestraApiTypes.GetConfigResponses["200"];
 export function makeConfig(
   overrides: {
     enterpriseFeatures?: Partial<Config["enterpriseFeatures"]>;
+    smallTeamTier?: Partial<Config["smallTeamTier"]>;
     features?: Partial<Config["features"]>;
     providerBaseUrls?: Config["providerBaseUrls"];
   } = {},
@@ -16,17 +17,30 @@ export function makeConfig(
       fullWhiteLabeling: false,
       ...overrides.enterpriseFeatures,
     },
+    smallTeamTier: {
+      threshold: 30,
+      userCount: 0,
+      smallTeam: true,
+      envFlag: false,
+      communicate: true,
+      ...overrides.smallTeamTier,
+    },
     features: {
+      betaEnabled: false,
       orchestratorK8sRuntime: false,
       sandbox: false,
+      sandboxArtifactBytesLimit: 16 * 1024 * 1024,
       agentSkillsEnabled: false,
+      agentEnvironmentsEnabled: false,
       appsEnabled: false,
+      projectsEnabled: false,
       byosEnabled: false,
       byosVaultKvVersion: "1",
       azureOpenAiEntraIdEnabled: false,
       bedrockIamAuthEnabled: false,
       geminiVertexAiEnabled: false,
       globalToolPolicy: "permissive",
+      discoveredToolPolicy: "relaxed",
       incomingEmail: { enabled: false },
       mcpServerBaseImage: "",
       orchestratorK8sNamespace: "",
@@ -54,6 +68,7 @@ export function makePublicConfig(
   return {
     disableBasicAuth: false,
     disableInvitations: false,
+    enterpriseCoreActive: false,
     analytics: {
       enabled: false,
       instanceId: null,

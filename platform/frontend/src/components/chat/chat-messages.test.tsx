@@ -1,6 +1,7 @@
 import type { UIMessage } from "@ai-sdk/react";
 import type { archestraApiTypes } from "@archestra/shared";
 import { fireEvent, render, screen } from "@testing-library/react";
+import type { ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/components/ai-elements/conversation", () => ({
@@ -84,39 +85,39 @@ vi.mock("@/components/chat/policy-denied-tool", () => ({
   PolicyDeniedTool: () => null,
 }));
 
-vi.mock("@/components/chat/auth-required-tool", () => ({
-  AuthRequiredTool: ({
-    catalogName,
-    onInstall,
+vi.mock("@/components/chat/auth-error-tool", () => ({
+  AuthErrorTool: ({
+    title,
+    description,
+    buttonText,
+    buttonUrl,
+    onAction,
+    openInNewTab = true,
   }: {
-    catalogName: string;
-    onInstall?: () => void;
+    title: string;
+    description: ReactNode;
+    buttonText?: string;
+    buttonUrl?: string;
+    onAction?: () => void;
+    openInNewTab?: boolean;
   }) => (
-    <button type="button" onClick={onInstall}>
-      auth-required:{catalogName}
-    </button>
-  ),
-}));
-
-vi.mock("@/components/chat/assigned-credential-unavailable-tool", () => ({
-  AssignedCredentialUnavailableTool: ({
-    catalogName,
-  }: {
-    catalogName: string;
-  }) => <div>assigned-credential-unavailable:{catalogName}</div>,
-}));
-
-vi.mock("@/components/chat/expired-auth-tool", () => ({
-  ExpiredAuthTool: ({
-    catalogName,
-    onReauth,
-  }: {
-    catalogName: string;
-    onReauth?: () => void;
-  }) => (
-    <button type="button" onClick={onReauth}>
-      expired-auth:{catalogName}
-    </button>
+    <div>
+      <div>auth-error:{title}</div>
+      <div>{description}</div>
+      {onAction && buttonText ? (
+        <button type="button" onClick={onAction}>
+          {buttonText}
+        </button>
+      ) : buttonText && buttonUrl ? (
+        <a
+          href={buttonUrl}
+          target={openInNewTab ? "_blank" : undefined}
+          rel={openInNewTab ? "noopener noreferrer" : undefined}
+        >
+          {buttonText}
+        </a>
+      ) : null}
+    </div>
   ),
 }));
 
@@ -180,13 +181,6 @@ vi.mock("@/lib/chat/chat-message.query", () => ({
   }),
 }));
 
-vi.mock("@/lib/knowledge/knowledge-files.query", () => ({
-  usePromoteChatAttachmentToKnowledgeFile: () => ({
-    mutateAsync: vi.fn(),
-    isPending: false,
-  }),
-}));
-
 vi.mock("@/lib/mcp/internal-mcp-catalog.query", () => ({
   useInternalMcpCatalog: () => ({ data: [] }),
 }));
@@ -195,6 +189,7 @@ vi.mock("@/lib/mcp/mcp-install-orchestrator.hook", () => ({
   useMcpInstallOrchestrator: () => ({
     triggerInstallByCatalogId: vi.fn(),
     triggerReauthByCatalogIdAndServerId: vi.fn(),
+    connectedCatalogIds: new Set<string>(),
   }),
 }));
 
@@ -606,6 +601,81 @@ describe("ChatMessages", () => {
     );
 
     expect(screen.getByText("Sensitive context below")).toBeInTheDocument();
+  });
+
+  it("subscribes the sticky-boundary listeners once and does not re-subscribe on an unrelated re-render", () => {
+    // The boundary element only mounts inside a scrollable ancestor; make every
+    // element report as scrollable so findScrollContainer resolves a container.
+    const realGetComputedStyle = window.getComputedStyle.bind(window);
+    const getComputedStyleSpy = vi
+      .spyOn(window, "getComputedStyle")
+      .mockImplementation((element: Element, pseudoElt?: string | null) => {
+        const style = realGetComputedStyle(element, pseudoElt);
+        Object.defineProperty(style, "overflowY", {
+          configurable: true,
+          get: () => "scroll",
+        });
+        return style;
+      });
+
+    const addSpy = vi.spyOn(HTMLElement.prototype, "addEventListener");
+
+    const messages = [
+      {
+        id: "assistant-unsafe",
+        role: "assistant",
+        parts: [
+          {
+            type: "tool-read_email",
+            toolCallId: "call-unsafe",
+            state: "output-available",
+            input: { folder: "inbox" },
+            output: { emails: [{ from: "ceo@external.com" }] },
+          },
+        ],
+      },
+    ] as UIMessage[];
+
+    const boundary = {
+      kind: "tool_result",
+      reason: "tool_result_marked_untrusted",
+      toolCallId: "call-unsafe",
+      toolName: "read_email",
+    } as const;
+
+    const { rerender } = render(
+      <ChatMessages
+        conversationId="conv-1"
+        messages={messages}
+        status="ready"
+        unsafeContextBoundary={boundary}
+      />,
+    );
+
+    const scrollSubscriptionsAfterMount = addSpy.mock.calls.filter(
+      ([eventName]) => eventName === "scroll",
+    ).length;
+    expect(scrollSubscriptionsAfterMount).toBeGreaterThanOrEqual(1);
+
+    addSpy.mockClear();
+
+    // Re-rendering without changing the boundary element must not re-subscribe the scroll listener.
+    rerender(
+      <ChatMessages
+        conversationId="conv-1"
+        messages={messages}
+        status="streaming"
+        unsafeContextBoundary={boundary}
+      />,
+    );
+
+    const scrollResubscriptions = addSpy.mock.calls.filter(
+      ([eventName]) => eventName === "scroll",
+    ).length;
+    expect(scrollResubscriptions).toBe(0);
+
+    addSpy.mockRestore();
+    getComputedStyleSpy.mockRestore();
   });
 
   it("renders the unsafe-context divider immediately after the unsafe tool result within the same message", () => {
@@ -1155,7 +1225,7 @@ describe("ChatMessages", () => {
     );
 
     expect(
-      screen.getByRole("button", { name: "expired-auth:id-jag test" }),
+      screen.getByRole("button", { name: "Re-authenticate" }),
     ).toBeInTheDocument();
     expect(
       screen.queryByText(/To re-authenticate, visit this URL:/),
@@ -1185,10 +1255,42 @@ describe("ChatMessages", () => {
     );
 
     expect(
-      screen.getByRole("button", { name: "auth-required:jwks demo" }),
+      screen.getByRole("button", { name: "Set up credentials" }),
     ).toBeInTheDocument();
     expect(
       screen.queryByText(/To set up your credentials, visit this URL:/),
+    ).not.toBeInTheDocument();
+  });
+
+  it("renders an identity-provider connect control as a same-tab link", () => {
+    const messages = [
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [
+          {
+            type: "text",
+            text: 'Authentication required for "jwks demo".\n\nNo credentials were found for your account (user: usr_123).\nTo set up your credentials, visit this URL: http://localhost:3000/sso/Okta',
+          },
+        ],
+      },
+    ] as UIMessage[];
+
+    render(
+      <ChatMessages
+        conversationId="conv-1"
+        messages={messages}
+        status="ready"
+      />,
+    );
+
+    const link = screen.getByRole("link", { name: "Connect Okta" });
+    expect(link).toBeInTheDocument();
+    expect(link).toHaveAttribute("href", "http://localhost:3000/sso/Okta");
+    expect(link).not.toHaveAttribute("target");
+    expect(link).not.toHaveAttribute("rel");
+    expect(
+      screen.queryByRole("button", { name: "Connect Okta" }),
     ).not.toBeInTheDocument();
   });
 
@@ -1231,7 +1333,7 @@ describe("ChatMessages", () => {
     );
 
     expect(
-      screen.getByRole("button", { name: "expired-auth:id-jag test" }),
+      screen.getByRole("button", { name: "Re-authenticate" }),
     ).toBeInTheDocument();
     expect(
       screen.queryByText("tool-id-jag_test__get_server_info"),
@@ -1273,9 +1375,7 @@ describe("ChatMessages", () => {
     );
 
     expect(
-      screen.getByText(
-        "assigned-credential-unavailable:githubcopilot__remote-mcp",
-      ),
+      screen.getByText(/credentials for.*githubcopilot__remote-mcp.*expired/),
     ).toBeInTheDocument();
     expect(
       screen.queryByText("tool-githubcopilot__remote-mcp__issue_write"),
@@ -1325,7 +1425,7 @@ describe("ChatMessages", () => {
     );
 
     expect(
-      screen.getAllByRole("button", { name: "expired-auth:id-jag test" }),
+      screen.getAllByRole("button", { name: "Re-authenticate" }),
     ).toHaveLength(1);
     expect(
       screen.queryByText(/Please re-authenticate by visiting this URL/i),
@@ -1347,7 +1447,7 @@ describe("owned-app inline rendering", () => {
         role: "assistant",
         parts: [
           {
-            type: "tool-sparky__create_app",
+            type: "tool-sparky__edit_app",
             toolCallId: "call-app-1",
             state: "output-available",
             input: { name: "To Do App", html: "<h1>hi</h1>" },
@@ -1369,8 +1469,7 @@ describe("owned-app inline rendering", () => {
   }
 
   it.each([
-    "create_app",
-    "update_app",
+    "edit_app",
     "render_app",
   ])("mounts the app-bound runtime for a branded %s result", (shortName) => {
     renderAppToolPart({ type: `tool-sparky__${shortName}` });
@@ -1380,9 +1479,16 @@ describe("owned-app inline rendering", () => {
     expect(section).toHaveAttribute("data-uri", `ui://archestra-app/${APP_ID}`);
   });
 
+  // scaffold_app only seeds the boilerplate template — it must not mount a
+  // canvas (the template flash is noise); the first edit_app is what renders.
+  it("does not mount for a branded scaffold_app result", () => {
+    renderAppToolPart({ type: "tool-sparky__scaffold_app" });
+    expect(screen.queryByTestId("mcp-app-section")).not.toBeInTheDocument();
+  });
+
   it.each([
-    "sparky__create_app",
-    "create_app",
+    "sparky__edit_app",
+    "edit_app",
   ])("mounts the app-bound runtime for a run_tool dispatch targeting %s", (targetName) => {
     renderAppToolPart({
       type: "tool-sparky__run_tool",
@@ -1398,8 +1504,8 @@ describe("owned-app inline rendering", () => {
     );
   });
 
-  it("does not mount for a foreign-prefix create_app result", () => {
-    renderAppToolPart({ type: "tool-other__create_app" });
+  it("does not mount for a foreign-prefix edit_app result", () => {
+    renderAppToolPart({ type: "tool-other__edit_app" });
     expect(screen.queryByTestId("mcp-app-section")).not.toBeInTheDocument();
   });
 
@@ -1411,6 +1517,16 @@ describe("owned-app inline rendering", () => {
         structuredContent: { apps: [appOutput.structuredContent] },
       },
     });
+    expect(screen.queryByTestId("mcp-app-section")).not.toBeInTheDocument();
+  });
+
+  // refine_app/validate_app return an app id but are not rendering tools: they
+  // must not mount a canvas (would otherwise re-render the app on every refine).
+  it.each([
+    "refine_app",
+    "validate_app",
+  ])("does not mount for a branded %s result carrying the app id", (shortName) => {
+    renderAppToolPart({ type: `tool-sparky__${shortName}` });
     expect(screen.queryByTestId("mcp-app-section")).not.toBeInTheDocument();
   });
 
@@ -1453,7 +1569,7 @@ describe("owned-app inline rendering", () => {
             output: { content: "results" },
           },
           {
-            type: "tool-sparky__create_app",
+            type: "tool-sparky__edit_app",
             toolCallId: "call-app-1",
             state: "output-available",
             input: { name: "To Do App", html: "<h1>hi</h1>" },

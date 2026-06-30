@@ -4,9 +4,9 @@ import { describe, expect, test, vi } from "@/test";
 import { CreateLimitSchema } from "@/types";
 import AgentModel from "./agent";
 import AgentTeamModel from "./agent-team";
+import EnvironmentDefaultUserLimitModel from "./environment-default-user-limit";
 import LimitModel, { LimitValidationService } from "./limit";
 import ModelModel from "./model";
-import OrganizationModel from "./organization";
 
 describe("CreateLimitSchema", () => {
   test("normalizes empty array to null for token_cost", () => {
@@ -1849,6 +1849,73 @@ describe("LimitValidationService", () => {
       expect(result).not.toBeNull();
       expect(result?.[1]).toContain("organization-level");
     });
+
+    test("evaluates limits across all entity levels without an N+1", async ({
+      makeOrganization,
+      makeAdmin,
+      makeTeam,
+      makeMember,
+      makeAgent,
+      makeSecret,
+      makeLlmProviderApiKey,
+    }) => {
+      const org = await makeOrganization();
+      const admin = await makeAdmin();
+      const team = await makeTeam(org.id, admin.id);
+      const agent = await makeAgent({
+        name: "Test Agent",
+        organizationId: org.id,
+      });
+      await makeMember(admin.id, org.id, { role: "admin" });
+      await AgentTeamModel.assignTeamsToAgent(agent.id, [team.id]);
+      const secret = await makeSecret();
+      const apiKey = await makeLlmProviderApiKey(org.id, secret.id);
+
+      // A token_cost limit (with usage) at every level the pre-request check
+      // inspects. Before batching, each level issued its own limit_model_usage
+      // and models lookups, so model pricing was fetched once per level.
+      const levels: {
+        entityType: "agent" | "user" | "team" | "organization" | "virtual_key";
+        entityId: string;
+      }[] = [
+        { entityType: "virtual_key", entityId: apiKey.id },
+        { entityType: "user", entityId: admin.id },
+        { entityType: "agent", entityId: agent.id },
+        { entityType: "team", entityId: team.id },
+        { entityType: "organization", entityId: org.id },
+      ];
+      for (const { entityType, entityId } of levels) {
+        const limit = await LimitModel.create({
+          entityType,
+          entityId,
+          limitType: "token_cost",
+          limitValue: 1_000_000,
+          model: ["gpt-4o"],
+        });
+        // Keep usage well under the limit so the request is allowed and every
+        // level is evaluated (no early-exit on a violation).
+        await LimitModel.updateTokenLimitUsage(
+          entityType,
+          entityId,
+          "gpt-4o",
+          1,
+          1,
+        );
+        await LimitModel.patch(limit.id, { lastCleanup: new Date() });
+      }
+
+      const findByModelIdsOnlySpy = vi.spyOn(ModelModel, "findByModelIdsOnly");
+
+      const result = await LimitValidationService.checkLimitsBeforeRequest({
+        agentId: agent.id,
+        userId: admin.id,
+        virtualKeyId: apiKey.id,
+      });
+
+      expect(result).toBeNull();
+      // One batched pricing lookup for the whole request, not one per level.
+      expect(findByModelIdsOnlySpy).toHaveBeenCalledTimes(1);
+    });
   });
 });
 
@@ -2241,28 +2308,18 @@ describe("cleanupLimitsIfNeeded", () => {
       cleanupInterval: "1m",
     });
 
-    await OrganizationModel.patch(org.id, {
-      defaultUserLimitValue: 100,
-      defaultUserLimitModel: ["gpt-4o"],
-      defaultUserLimitCleanupInterval: "12h",
+    // The org-wide default lives in the unified default_user_limits store
+    // (NULL environment), never as a concrete per-user `limits` row.
+    await EnvironmentDefaultUserLimitModel.create({
+      organizationId: org.id,
+      environmentId: null,
+      limitValue: 100,
+      model: ["gpt-4o"],
+      cleanupInterval: "12h",
     });
 
-    let firstUserLimits = await LimitModel.findAll("user", firstUser.id);
-    let secondUserLimits = await LimitModel.findAll("user", secondUser.id);
-    expect(firstUserLimits).toHaveLength(1);
-    expect(secondUserLimits).toHaveLength(0);
-    expect(
-      firstUserLimits.find((limit) => limit.id === manualLimit.id),
-    ).toBeDefined();
-
-    await OrganizationModel.patch(org.id, {
-      defaultUserLimitValue: 200,
-      defaultUserLimitModel: null,
-      defaultUserLimitCleanupInterval: "1w",
-    });
-
-    firstUserLimits = await LimitModel.findAll("user", firstUser.id);
-    secondUserLimits = await LimitModel.findAll("user", secondUser.id);
+    const firstUserLimits = await LimitModel.findAll("user", firstUser.id);
+    const secondUserLimits = await LimitModel.findAll("user", secondUser.id);
     expect(firstUserLimits).toHaveLength(1);
     expect(secondUserLimits).toHaveLength(0);
     expect(
@@ -2282,10 +2339,12 @@ describe("cleanupLimitsIfNeeded", () => {
     await makeMember(user.id, org.id);
     const agent = await makeAgent({ organizationId: org.id });
 
-    await OrganizationModel.patch(org.id, {
-      defaultUserLimitValue: 1,
-      defaultUserLimitModel: ["gpt-4o"],
-      defaultUserLimitCleanupInterval: "1w",
+    await EnvironmentDefaultUserLimitModel.create({
+      organizationId: org.id,
+      environmentId: null,
+      limitValue: 1,
+      model: ["gpt-4o"],
+      cleanupInterval: "1w",
     });
     const interaction = await makeInteraction(agent.id, {
       model: "gpt-4o",
@@ -2323,10 +2382,12 @@ describe("cleanupLimitsIfNeeded", () => {
     await makeMember(user.id, org.id);
     const agent = await makeAgent({ organizationId: org.id });
 
-    await OrganizationModel.patch(org.id, {
-      defaultUserLimitValue: 1,
-      defaultUserLimitModel: null,
-      defaultUserLimitCleanupInterval: "1w",
+    await EnvironmentDefaultUserLimitModel.create({
+      organizationId: org.id,
+      environmentId: null,
+      limitValue: 1,
+      model: null,
+      cleanupInterval: "1w",
     });
     await LimitModel.create({
       entityType: "user",

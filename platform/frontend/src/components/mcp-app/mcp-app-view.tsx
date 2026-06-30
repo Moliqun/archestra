@@ -35,7 +35,8 @@ import { useFeature } from "@/lib/config/config.query";
  */
 type McpAppEndpoint =
   | { kind: "agent"; agentId: string; serverPrefix: string }
-  | { kind: "app"; appId: string };
+  | { kind: "app"; appId: string }
+  | { kind: "server"; mcpServerId: string };
 
 /** MCP CallToolResult — defined inline to avoid direct @modelcontextprotocol/sdk dependency. */
 export type McpCallToolResult = {
@@ -93,7 +94,9 @@ export const McpAppRuntime = function McpAppRuntime({
   preloadedResource,
   onResourceStateChange,
   appVersion,
-  containerMaxHeight,
+  containerDimensions,
+  reloadNonce,
+  inlineInitialHeight,
 }: {
   toolResourceUri: string;
   endpoint: McpAppEndpoint;
@@ -110,11 +113,21 @@ export const McpAppRuntime = function McpAppRuntime({
   onResourceStateChange: (state: "renderable" | "empty") => void;
   /** Owned-app version this render shows — keys the render-loop diagnostics. */
   appVersion?: number | null;
-  /** Inline visual ceiling from the host card; absent on full-bleed surfaces
-   * (run page, preview). Drives the guest size hint and pre-report height. */
-  containerMaxHeight?: number;
+  /** Container size hint forwarded to the guest (SEP-1865 `containerDimensions`).
+   * `maxHeight` is the inline visual ceiling from the host card; absent on
+   * full-bleed surfaces (run page, preview). Drives the guest size hint and the
+   * pre-report height. */
+  containerDimensions?: { maxHeight?: number };
+  /** Bump to remount (reload) the sandboxed iframe — re-runs its creation effect. */
+  reloadNonce?: number;
+  /** Last measured inline height; seeds the iframe + loading box so a fresh
+   * mount (e.g. returning from the panel) doesn't collapse before the app loads. */
+  inlineInitialHeight?: number;
 }) {
   const { resolvedTheme } = useTheme();
+  // The host only ever caps height (width is unbounded); unpack the SEP-shaped
+  // hint into the single value the size logic below threads through.
+  const containerMaxHeight = containerDimensions?.maxHeight;
   const [bridge, setBridge] = useState<AppBridge | null>(null);
   const [appResource, setAppResource] = useState<AppResourceMeta | null>(
     preloadedResource ?? null,
@@ -128,13 +141,17 @@ export const McpAppRuntime = function McpAppRuntime({
   const endpointKey =
     endpoint.kind === "agent"
       ? `agent:${endpoint.agentId}:${endpoint.serverPrefix}`
-      : `app:${endpoint.appId}`;
+      : endpoint.kind === "server"
+        ? `server:${endpoint.mcpServerId}`
+        : `app:${endpoint.appId}`;
   // Sandbox-subdomain hash seed. Apps get a per-app bucket matching the backend
   // MCP server name; isolation does not depend on this being collision-free.
   const sandboxPrefix =
     endpoint.kind === "agent"
       ? endpoint.serverPrefix
-      : `archestra-app-${endpoint.appId}`;
+      : endpoint.kind === "server"
+        ? `archestra-mcp-server-${endpoint.mcpServerId}`
+        : `archestra-app-${endpoint.appId}`;
 
   // Use refs for all callbacks to avoid recreating bridge when props change
   const displayModeRef = useRef(displayMode);
@@ -157,6 +174,10 @@ export const McpAppRuntime = function McpAppRuntime({
   const rpcIdRef = useRef(0);
   // Shared cancel ref so the prop-update useEffect can cancel an in-flight fallback fetch.
   const fetchCancelledRef = useRef(false);
+  // Last height the guest reported. A reload recreates the iframe; starting it at
+  // this height (instead of the default) avoids a collapse-then-grow jump while
+  // the reloaded app re-reports its size.
+  const lastReportedHeightRef = useRef<number | null>(null);
 
   // Render-loop diagnostics (owned apps only): runtime errors / CSP violations
   // forwarded by the sandbox proxy are validated and collected per
@@ -320,7 +341,9 @@ export const McpAppRuntime = function McpAppRuntime({
     const mcpUrl =
       endpoint.kind === "agent"
         ? `/api/mcp/${endpoint.agentId}`
-        : `/api/mcp/app/${endpoint.appId}`;
+        : endpoint.kind === "server"
+          ? `/api/mcp/server/${endpoint.mcpServerId}`
+          : `/api/mcp/app/${endpoint.appId}`;
 
     // Proxy a JSON-RPC method to the backend MCP gateway (agent or app endpoint).
     const mcpProxy = async (method: string, params: unknown) => {
@@ -531,7 +554,11 @@ export const McpAppRuntime = function McpAppRuntime({
       fetchCancelledRef.current = true;
       appBridge.teardownResource({}).catch(() => {});
     };
-  }, [endpointKey, toolResourceUri]);
+    // reloadNonce: bumping it rebuilds the bridge from scratch (a clean reload).
+    // The iframe reconnects automatically since SandboxIframe's connect effect
+    // keys on the bridge identity — remounting only the iframe would instead
+    // reconnect the already-connected bridge and throw.
+  }, [endpointKey, toolResourceUri, reloadNonce]);
 
   // If preloadedResource arrives as a prop update after initial mount (race
   // condition: tool part rendered before the SSE event was processed), apply it.
@@ -634,7 +661,14 @@ export const McpAppRuntime = function McpAppRuntime({
         </div>
       )}
       {!loadError && (!bridge || !appResource) && (
-        <div className="flex items-center justify-center rounded-lg bg-muted/50 min-h-[100px]">
+        <div
+          className="flex items-center justify-center rounded-lg bg-muted/50 min-h-[100px]"
+          style={
+            inlineInitialHeight != null
+              ? { minHeight: `${inlineInitialHeight}px` }
+              : undefined
+          }
+        >
           <div className="flex flex-col items-center gap-3 text-muted-foreground">
             <div className="h-6 w-6 animate-spin rounded-full border-2 border-current border-t-transparent" />
             <span className="text-sm">Loading...</span>
@@ -652,6 +686,9 @@ export const McpAppRuntime = function McpAppRuntime({
           toolResult={toolResult}
           onError={onError}
           onSizeChanged={(size) => {
+            if (typeof size.height === "number" && size.height > 0) {
+              lastReportedHeightRef.current = size.height;
+            }
             onSizeChangeRef.current({
               width: size.width ?? 0,
               height: size.height ?? 0,
@@ -659,12 +696,16 @@ export const McpAppRuntime = function McpAppRuntime({
           }}
           useDedicatedOrigin={sandboxResult.hasCrossOrigin}
           initialHeight={
-            containerMaxHeight != null
+            lastReportedHeightRef.current ??
+            inlineInitialHeight ??
+            (containerMaxHeight != null
               ? INITIAL_INLINE_HEIGHT
-              : UNCAPPED_INITIAL_HEIGHT
+              : UNCAPPED_INITIAL_HEIGHT)
           }
+          maxHeight={containerMaxHeight}
           onDiagnostic={ownedAppId ? handleDiagnostic : undefined}
           onScreenshot={ownedAppId ? handleScreenshot : undefined}
+          ownedApp={ownedAppId != null}
         />
       )}
     </div>
@@ -699,8 +740,10 @@ function SandboxIframe({
   onSizeChanged,
   useDedicatedOrigin,
   initialHeight = UNCAPPED_INITIAL_HEIGHT,
+  maxHeight,
   onDiagnostic,
   onScreenshot,
+  ownedApp,
 }: {
   html: string;
   sandboxUrl: URL;
@@ -715,14 +758,32 @@ function SandboxIframe({
   useDedicatedOrigin?: boolean;
   /** Iframe height before the first app size report. */
   initialHeight?: number;
+  /**
+   * Visual ceiling for the iframe height. When set, reported heights are clamped
+   * to it so a viewport-relative app (e.g. one sized to `100vh`) can't drive the
+   * auto-resize SDK into an ever-growing feedback loop; content past the cap
+   * scrolls within the iframe. Absent on uncapped surfaces (panel fill,
+   * fullscreen, apps page).
+   */
+  maxHeight?: number;
   /** Raw runtime-error / csp-violation payloads forwarded by the sandbox proxy. */
   onDiagnostic?: (data: unknown) => void;
   /** Raw screenshot payload forwarded by the sandbox proxy. */
   onScreenshot?: (data: unknown) => void;
+  /** Archestra-owned app: its envelope carries the platform CSP, so the proxy
+   * must not inject a second one. A trusted host signal, not derived from HTML. */
+  ownedApp?: boolean;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
-  const [ready, setReady] = useState(false);
+  // Track WHICH bridge is connected, not just a boolean: a reload swaps in a new
+  // bridge instance, and `ready` must read false the instant the identity changes
+  // — otherwise the send effects below fire against the not-yet-connected bridge
+  // and throw "Not connected".
+  const [connectedBridge, setConnectedBridge] = useState<AppBridge | null>(
+    null,
+  );
+  const ready = connectedBridge === appBridge;
   const [initialized, setInitialized] = useState(false);
   const [error, setError] = useState<Error | null>(null);
   const onSizeChangedRef = useRef(onSizeChanged);
@@ -732,6 +793,9 @@ function SandboxIframe({
   // Read at iframe-creation time only; a ref keeps it out of the effect deps so
   // the iframe never remounts when the height changes.
   const initialHeightRef = useRef(initialHeight);
+  // Read inside the (effect-bound) size handler; a ref keeps the latest cap
+  // without re-binding onsizechange on every cap change.
+  const maxHeightRef = useRef(maxHeight);
 
   useEffect(() => {
     onSizeChangedRef.current = onSizeChanged;
@@ -739,6 +803,7 @@ function SandboxIframe({
     onDiagnosticRef.current = onDiagnostic;
     onScreenshotRef.current = onScreenshot;
     initialHeightRef.current = initialHeight;
+    maxHeightRef.current = maxHeight;
   });
 
   // Create iframe, wait for proxy-ready, connect bridge
@@ -793,7 +858,7 @@ function SandboxIframe({
         appBridge
           .connect(transport)
           .then(() => {
-            if (!cancelled) setReady(true);
+            if (!cancelled) setConnectedBridge(appBridge);
           })
           .catch((err) => {
             if (!cancelled) {
@@ -842,7 +907,7 @@ function SandboxIframe({
       // stay stale-true after a re-render that re-runs this effect (e.g.
       // editing a message re-renders the message list), and sendToolInput
       // throws "Not connected".
-      setReady(false);
+      setConnectedBridge((current) => (current === appBridge ? null : current));
       setInitialized(false);
     };
   }, [sandboxUrl.href, sandboxUrl.origin, appBridge, useDedicatedOrigin]);
@@ -852,13 +917,21 @@ function SandboxIframe({
     if (!ready) return;
 
     appBridge.onsizechange = (params) => {
-      onSizeChangedRef.current?.(params);
+      // Clamp to the surface ceiling before applying or reporting: an app sized
+      // to the iframe viewport (e.g. 100vh) otherwise makes each measurement
+      // taller than the last, inflating the iframe without bound. Reporting the
+      // clamped height also keeps the frozen panel placeholder honest.
+      const max = maxHeightRef.current;
+      const height =
+        params.height !== undefined && max != null
+          ? Math.min(params.height, max)
+          : params.height;
+      onSizeChangedRef.current?.({ width: params.width, height });
       const iframe = iframeRef.current;
       if (iframe) {
         if (params.width !== undefined)
           iframe.style.width = `${params.width}px`;
-        if (params.height !== undefined)
-          iframe.style.height = `${params.height}px`;
+        if (height !== undefined) iframe.style.height = `${height}px`;
       }
     };
 
@@ -871,13 +944,22 @@ function SandboxIframe({
   useEffect(() => {
     if (!ready || !html) return;
     appBridge
-      .sendSandboxResourceReady({ html, csp, permissions })
+      // `ownedApp` is a trusted host signal: Archestra-owned apps carry the
+      // platform CSP in their backend envelope, so the proxy must not add a
+      // second one. It is NOT in the ext-apps notification type, but the
+      // notification forwards params verbatim and the proxy reads it raw.
+      .sendSandboxResourceReady({
+        html,
+        csp,
+        permissions,
+        ...(ownedApp ? { ownedApp: true } : {}),
+      } as Parameters<typeof appBridge.sendSandboxResourceReady>[0])
       .catch((err) => {
         const error = err instanceof Error ? err : new Error(String(err));
         setError(error);
         onErrorRef.current?.(error);
       });
-  }, [ready, html, appBridge, csp, permissions]);
+  }, [ready, html, appBridge, csp, permissions, ownedApp]);
 
   // Send tool input when available
   useEffect(() => {

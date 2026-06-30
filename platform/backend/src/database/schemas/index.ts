@@ -55,7 +55,6 @@ export { default as appsTable } from "./app";
 export { default as appDataTable } from "./app-data";
 export { default as appRenderDiagnosticsTable } from "./app-render-diagnostics";
 export { default as appRenderScreenshotTable } from "./app-render-screenshot";
-export { default as appTeamTable } from "./app-team";
 export { default as appToolsTable } from "./app-tool";
 export { default as appVersionsTable } from "./app-version";
 export { default as auditLogsTable } from "./audit-log";
@@ -83,6 +82,8 @@ export {
   default as conversationSharesTable,
 } from "./conversation-share";
 export { default as environmentsTable } from "./environment";
+export { default as environmentDefaultUserLimitsTable } from "./environment-default-user-limits";
+export { default as filesTable } from "./file";
 export { default as githubAppConfigsTable } from "./github-app-config";
 export { default as hookFilesTable } from "./hook-file";
 export { default as identityProvidersTable } from "./identity-provider";
@@ -93,7 +94,6 @@ export { default as invitationsTable } from "./invitation";
 export { default as jwksTable } from "./jwks";
 export { default as kbChunksTable } from "./kb-chunk";
 export { default as kbDocumentsTable } from "./kb-document";
-export { default as kbUploadedFilesTable } from "./kb-uploaded-file";
 export { default as knowledgeBasesTable } from "./knowledge-base";
 export {
   default as knowledgeBaseConnectorsTable,
@@ -124,6 +124,12 @@ export { default as optimizationRulesTable } from "./optimization-rule";
 export { default as organizationsTable } from "./organization";
 export { organizationRole as organizationRolesTable } from "./organization-role";
 export { default as processedEmailsTable } from "./processed-email";
+export {
+  default as projectsTable,
+  projectSharesTable,
+  projectShareTeamsTable,
+} from "./project";
+export { default as projectPinsTable } from "./project-pin";
 export { default as scheduleTriggersTable } from "./schedule-trigger";
 export { default as scheduleTriggerRunsTable } from "./schedule-trigger-run";
 export { default as secretsTable } from "./secret";
@@ -160,5 +166,6 @@ export { default as usersTable } from "./user";
 export { default as userTokensTable } from "./user-token";
 export { default as verificationsTable } from "./verification";
 export { default as virtualApiKeysTable } from "./virtual-api-key";
+export { default as virtualApiKeyLlmProxiesTable } from "./virtual-api-key-llm-proxy";
 export { default as virtualApiKeyProviderApiKeysTable } from "./virtual-api-key-provider-api-key";
 export { default as virtualApiKeyTeamsTable } from "./virtual-api-key-team";

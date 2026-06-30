@@ -1,6 +1,5 @@
 import { type archestraApiTypes, parseFullToolName } from "@archestra/shared";
-import type { McpUiDisplayMode } from "@modelcontextprotocol/ext-apps";
-import { PanelRightOpen } from "lucide-react";
+import { AppWindow } from "lucide-react";
 import type React from "react";
 import {
   Component,
@@ -12,24 +11,45 @@ import {
   useSyncExternalStore,
 } from "react";
 import { createPortal } from "react-dom";
-import { usePinnedCanvas } from "@/components/chat/pinned-canvas-context";
+import { useApps } from "@/components/chat/apps-context";
 import {
-  clampInlineHeight,
-  INITIAL_INLINE_HEIGHT,
-  useInlineCeiling,
-} from "@/components/mcp-app/app-height";
+  getAppRenderVerb,
+  isSupersededRender,
+  mcpToolLabel,
+} from "@/components/chat/chat-messages.utils";
+import { INITIAL_INLINE_HEIGHT } from "@/components/mcp-app/app-height";
+import { AppSettingsForm } from "@/components/mcp-app/app-settings-form";
+import { McpAppCard } from "@/components/mcp-app/mcp-app-card";
+import {
+  McpAppAddressPill,
+  McpAppBackButton,
+  McpAppChangelogPill,
+  McpAppFullscreenExitButton,
+  McpAppPanelButton,
+  McpAppRefreshButton,
+  McpAppSaveButton,
+  McpAppSettingsButton,
+  McpAppStandaloneButton,
+  McpAppSwitcher,
+  McpAppTopBar,
+} from "@/components/mcp-app/mcp-app-chrome";
 import {
   type AppResourceMeta,
   isRenderableMcpAppHtml,
   McpAppRuntime,
   type McpCallToolResult,
 } from "@/components/mcp-app/mcp-app-view";
-import { Button } from "@/components/ui/button";
+import { useAppRuntimeControls } from "@/components/mcp-app/use-app-runtime-controls";
+import { useApp } from "@/lib/app.query";
 import {
   getAppDiagnosticCounts,
   subscribeAppDiagnostics,
 } from "@/lib/chat/app-diagnostics-store";
-import { cn } from "@/lib/utils";
+
+// Ties the settings form to its top-bar save button via the HTML `form` attr.
+// Only the selected panel app shows settings (one at a time), so a single id is
+// safe.
+const APP_SETTINGS_FORM_ID = "app-settings-form";
 
 /**
  * Shape of MCP tool output stored by the backend in the AI SDK's tool result.
@@ -73,6 +93,34 @@ class McpAppErrorBoundary extends Component<
   }
 }
 
+/** Stable no-op size reporter for the panel-hosted (fill) render. */
+const noopSizeChange = () => {};
+
+/**
+ * The chat-inline card caps its body at `max(320px, 60vh)` and the runtime
+ * clamps the iframe to this ceiling. Some apps size their layout to the iframe
+ * viewport (e.g. `100vh`); the auto-resize SDK then measures content that grows
+ * with the viewport, so each report makes the next taller and the host would
+ * inflate the iframe without bound. Clamping settles the loop (content scrolls
+ * within the iframe). Tracks `innerHeight` so the cap follows window resizes.
+ */
+function computeInlineHeightCap() {
+  return typeof window === "undefined"
+    ? INITIAL_INLINE_HEIGHT
+    : Math.max(INITIAL_INLINE_HEIGHT, Math.round(window.innerHeight * 0.6));
+}
+
+function useInlineHeightCap() {
+  const [cap, setCap] = useState(computeInlineHeightCap);
+  useEffect(() => {
+    const update = () => setCap(computeInlineHeightCap());
+    update();
+    window.addEventListener("resize", update);
+    return () => window.removeEventListener("resize", update);
+  }, []);
+  return cap;
+}
+
 /**
  * Self-contained MCP App section for use inside a Tool collapsible.
  * Owns display-mode / size state and the rawToolResult derivation so the
@@ -82,6 +130,7 @@ export function McpAppSection({
   uiResourceUri,
   agentId,
   appId,
+  appName,
   appVersion,
   toolName,
   toolCallId,
@@ -99,11 +148,12 @@ export function McpAppSection({
    * forwarded into the iframe (they are not app data).
    */
   appId?: string;
+  appName?: string | null;
   /** Owned-app version this render shows — keys the render-loop diagnostics. */
   appVersion?: number | null;
   /** Full prefixed tool name (e.g. "system__get-system-stats") — used to derive the server prefix for oncalltool */
   toolName: string;
-  /** Stable identifier for this canvas, used to pin it to the sidebar. */
+  /** Stable identifier for this app, used to select it in the panel. */
   toolCallId?: string;
   toolInput?: Record<string, unknown>;
   /** Tool result for the iframe; omitted for owned apps (management payloads are not app data) */
@@ -114,11 +164,17 @@ export function McpAppSection({
   onSendMessage?: (text: string) => void;
 }) {
   const resourceKey = `${agentId}:${uiResourceUri}`;
-  const inlineCeiling = useInlineCeiling();
-  const [displayMode, setDisplayMode] = useState<McpUiDisplayMode>("inline");
+  const { displayMode, setDisplayMode, toggleFullscreen, reloadNonce, reload } =
+    useAppRuntimeControls();
   const [size, setSize] = useState<{ width: number; height: number } | null>(
     null,
   );
+  // Mirrors the settings form's save state so the top bar's save button (which
+  // lives outside that form) can disable / show a spinner.
+  const [settingsSaveStatus, setSettingsSaveStatus] = useState({
+    saving: false,
+    disabled: false,
+  });
   const [resourceState, setResourceState] = useState<{
     key: string;
     state: "unknown" | "renderable" | "empty";
@@ -133,17 +189,42 @@ export function McpAppSection({
   const effectiveResourceState =
     resourceState.key === resourceKey ? resourceState.state : "unknown";
 
-  const { selectedCanvasId, select, showInSidebar, portalTarget } =
-    usePinnedCanvas();
+  const {
+    apps,
+    selectedToolCallId,
+    select,
+    showInPanel,
+    closePanel,
+    portalTarget,
+    settingsOpen,
+    setSettingsOpen,
+  } = useApps();
 
-  const parsedToolName = parseFullToolName(toolName);
-  const shortToolName = parsedToolName.toolName ?? toolName;
-  const isSelected = !!toolCallId && selectedCanvasId === toolCallId;
-  const sidebarHostingActive = portalTarget !== null;
-  // When the sidebar canvas tab is open, every inline canvas is replaced by a
-  // placeholder; only the *selected* canvas's iframe lives in the sidebar.
-  const renderInSidebar = sidebarHostingActive && isSelected;
-  const renderPlaceholder = sidebarHostingActive;
+  // Owned apps can be renamed/re-described from the address bar. Read the live
+  // app so the title stays in sync after an edit (the appName prop is captured
+  // at render time) and to seed the edit dialog.
+  const inlineHeightCap = useInlineHeightCap();
+  const { data: ownedApp, isSuccess: ownedAppResolved } = useApp(appId ?? null);
+  // A deleted (or no-longer-accessible) owned app: the fetch settled but
+  // `allowNotFound` turned the 404 into a successful `null`. Render a graceful
+  // placeholder instead of mounting the runtime, which would 404 again.
+  const ownedAppUnavailable = !!appId && ownedAppResolved && ownedApp === null;
+
+  const headerName = ownedApp?.name || appName || mcpToolLabel(toolName);
+  const isSelected = !!toolCallId && selectedToolCallId === toolCallId;
+  const panelHostingActive = portalTarget !== null;
+  // Only the *selected* app moves to the panel: its iframe is portaled into
+  // the panel and its inline spot becomes a placeholder. Every other inline app
+  // keeps rendering live in the chat.
+  const renderInPanel = panelHostingActive && isSelected;
+
+  // Track the last inline body height while the app shows inline; once it moves
+  // to the panel we stop updating, so the chat placeholder keeps that frozen
+  // footprint and messages below it don't reflow.
+  const lastInlineHeightRef = useRef(INITIAL_INLINE_HEIGHT);
+  if (!renderInPanel) {
+    lastInlineHeightRef.current = size?.height ?? INITIAL_INLINE_HEIGHT;
+  }
 
   // Reconstruct McpCallToolResult for AppFrame. Owned apps get none — the
   // management tool's result is not app data.
@@ -159,14 +240,10 @@ export function McpAppSection({
     };
   }, [rawOutput, appId]);
 
-  const handleSelect = () => {
+  const handleShowInPanel = () => {
     if (!toolCallId) return;
-    select(toolCallId);
-  };
-
-  const handleShowInSidebar = () => {
-    if (!toolCallId) return;
-    showInSidebar(toolCallId);
+    setDisplayMode("inline"); // panel is the app's frame — never fullscreen there
+    showInPanel(toolCallId);
   };
 
   const handleResourceStateChange = useCallback(
@@ -191,288 +268,207 @@ export function McpAppSection({
     return null;
   }
 
-  const canvas = (
-    <McpAppErrorBoundary>
-      <McpAppContainer
-        displayMode={displayMode}
-        onClose={() => setDisplayMode("inline")}
-        size={size}
-        inlineCeiling={inlineCeiling}
-        onShowInSidebar={
-          toolCallId && !renderInSidebar ? handleShowInSidebar : undefined
-        }
-        fillContainer={renderInSidebar}
-      >
-        {(errorCount > 0 || logCount > 0) && (
-          <div className="mb-2 flex w-fit flex-wrap items-center gap-1.5">
-            {errorCount > 0 && (
-              <div className="rounded-md border border-destructive/50 bg-destructive/10 px-2 py-0.5 text-xs text-destructive">
-                {errorCount === 1
-                  ? "1 runtime error"
-                  : `${errorCount} runtime errors`}{" "}
-                in this app
-              </div>
-            )}
-            {logCount > 0 && (
-              <div className="rounded-md border border-border bg-muted/50 px-2 py-0.5 text-xs text-muted-foreground">
-                {logCount === 1 ? "1 log" : `${logCount} logs`} from this app
-              </div>
-            )}
-          </div>
-        )}
-        <McpAppRuntime
-          toolResourceUri={uiResourceUri}
-          endpoint={
-            appId
-              ? { kind: "app", appId }
-              : {
-                  kind: "agent",
-                  agentId,
-                  serverPrefix:
-                    parseFullToolName(toolName).serverName ?? toolName,
-                }
-          }
-          displayMode={displayMode}
-          onDisplayModeChange={setDisplayMode}
-          onSizeChange={setSize}
-          containerMaxHeight={renderInSidebar ? undefined : inlineCeiling}
-          toolInput={appId ? undefined : toolInput}
-          toolResult={toolResult}
-          preloadedResource={preloadedResource}
-          onResourceStateChange={handleResourceStateChange}
-          onSendMessage={onSendMessage}
-          appVersion={appVersion}
-        />
-      </McpAppContainer>
-    </McpAppErrorBoundary>
-  );
-
-  if (renderPlaceholder) {
+  // A superseded render (a newer render of the same app — keyed by
+  // uiResourceUri — exists in the conversation) collapses to a static changelog
+  // pill instead of mounting the live runtime, so only the latest render of each
+  // app stays live. Applies to both owned apps and external MCP-UI calls; the
+  // pill degrades to just the label for non-owned renders (no version/verb).
+  if (isSupersededRender({ apps, toolCallId, appId })) {
     return (
-      <>
-        <SidebarCanvasPlaceholder
-          label={shortToolName}
-          isSelected={isSelected}
-          onSelect={handleSelect}
-        />
-        {renderInSidebar && portalTarget && createPortal(canvas, portalTarget)}
-      </>
+      <McpAppChangelogPill
+        appName={appName ?? mcpToolLabel(toolName)}
+        version={appVersion ?? null}
+        verb={getAppRenderVerb(toolName)}
+      />
     );
   }
 
-  return canvas;
-}
-
-function SidebarCanvasPlaceholder({
-  label,
-  isSelected,
-  onSelect,
-}: {
-  label: string;
-  isSelected: boolean;
-  onSelect: () => void;
-}) {
-  return (
-    <div
-      className={cn(
-        "rounded-md border border-dashed bg-muted/30 p-3 flex items-center justify-between gap-2 text-xs",
-        isSelected
-          ? "border-primary/50 text-foreground"
-          : "border-border text-muted-foreground",
-      )}
-    >
-      <div className="flex items-center gap-2 min-w-0">
-        <PanelRightOpen className="h-3.5 w-3.5 shrink-0" />
-        <span className="truncate font-medium">{label}</span>
+  // A deleted (or no-longer-accessible) owned app: it's already dropped from the
+  // panel, so this only shows in the chat stream. Degrade to a small, light pill
+  // instead of mounting the runtime (which would 404) behind browser-like chrome.
+  if (ownedAppUnavailable) {
+    return (
+      <div className="flex w-fit items-center gap-1.5 rounded-md border border-border/60 bg-muted/30 px-2 py-1 text-xs text-muted-foreground">
+        <AppWindow className="h-3.5 w-3.5 shrink-0" />
+        <span>{headerName} app is no longer available</span>
       </div>
-      {isSelected && (
-        <span className="h-7 flex items-center px-3 text-xs text-primary shrink-0">
-          Showing in sidebar
-        </span>
-      )}
-      {!isSelected && (
-        <Button
-          variant="ghost"
-          size="sm"
-          className="h-7 text-xs shrink-0"
-          onClick={onSelect}
-        >
-          Show in sidebar
-        </Button>
-      )}
-    </div>
-  );
-}
+    );
+  }
 
-/**
- * Container that handles display mode switching (inline ↔ fullscreen).
- *
- * Uses a single stable React tree for both modes so that children (iframe)
- * are never unmounted/remounted when toggling — only CSS classes change.
- *
- * In fullscreen, uses `position: fixed` sized to the Conversation scroll area
- * (found via `role="log"`) so the chat input remains visible below.
- */
-function McpAppContainer({
-  displayMode,
-  onClose,
-  children,
-  size,
-  inlineCeiling,
-  onShowInSidebar,
-  fillContainer = false,
-}: {
-  displayMode: McpUiDisplayMode;
-  onClose: () => void;
-  children: React.ReactNode;
-  size: { width: number; height: number } | null;
-  /** Viewport-derived max height for the inline card; reacts to window resize. */
-  inlineCeiling: number;
-  /** Inline-mode action: send this canvas to the sidebar. */
-  onShowInSidebar?: () => void;
-  /** When true, the canvas fills its parent container (used when portaled to sidebar). */
-  fillContainer?: boolean;
-}) {
-  const isFullscreen = displayMode === "fullscreen";
-  const containerRef = useRef<HTMLDivElement>(null);
-  const [bounds, setBounds] = useState<{
-    top: number;
-    left: number;
-    width: number;
-    height: number;
-  } | null>(null);
+  const diagnosticsBadge =
+    errorCount > 0 || logCount > 0 ? (
+      <div className="mb-2 flex w-fit flex-wrap items-center gap-1.5">
+        {errorCount > 0 && (
+          <div className="rounded-md border border-destructive/50 bg-destructive/10 px-2 py-0.5 text-xs text-destructive">
+            {errorCount === 1
+              ? "1 runtime error"
+              : `${errorCount} runtime errors`}{" "}
+            in this app
+          </div>
+        )}
+        {logCount > 0 && (
+          <div className="rounded-md border border-border bg-muted/50 px-2 py-0.5 text-xs text-muted-foreground">
+            {logCount === 1 ? "1 log" : `${logCount} logs`} from this app
+          </div>
+        )}
+      </div>
+    ) : null;
 
-  useEffect(() => {
-    if (!isFullscreen) return;
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
-    };
-    window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [isFullscreen, onClose]);
+  // The address bar every surface shares: refresh as the leading icon and
+  // open-in-new-tab as the trailing in-pill action (matching the side panel).
+  // The switcher only applies in the single panel slot; inline renders are each
+  // their own card, so they always get the static pill.
+  const refreshLeading = <McpAppRefreshButton onClick={reload} />;
+  const standaloneAction = appId ? (
+    <McpAppStandaloneButton appId={appId} />
+  ) : null;
+  const addressBar =
+    renderInPanel && apps.length > 1 ? (
+      <McpAppSwitcher
+        value={selectedToolCallId}
+        options={apps.map((app) => ({
+          value: app.toolCallId,
+          label: app.label,
+        }))}
+        onChange={select}
+        leading={refreshLeading}
+        actions={standaloneAction}
+      />
+    ) : (
+      <McpAppAddressPill
+        label={headerName}
+        leading={refreshLeading}
+        actions={standaloneAction}
+      />
+    );
 
-  // Cover the entire viewport in fullscreen mode
-  useEffect(() => {
-    if (!isFullscreen) {
-      setBounds(null);
-      return;
-    }
-    setBounds({
-      top: 0,
-      left: 0,
-      width: window.innerWidth,
-      height: window.innerHeight,
-    });
-    const update = () => {
-      setBounds({
-        top: 0,
-        left: 0,
-        width: window.innerWidth,
-        height: window.innerHeight,
-      });
-    };
-    window.addEventListener("resize", update);
-    return () => {
-      window.removeEventListener("resize", update);
-    };
-  }, [isFullscreen]);
-
-  return (
-    <div
-      ref={containerRef}
-      className={cn(
-        "will-change-auto origin-center transition-all duration-400 ease-[cubic-bezier(0.23,1,0.32,1)] relative group",
-        isFullscreen ? "fixed z-[100] bg-background flex flex-col" : "",
-        fillContainer && !isFullscreen ? "h-full flex flex-col" : "",
-        isFullscreen && !bounds
-          ? "opacity-0 scale-95 pointer-events-none"
-          : "opacity-100 scale-100",
-      )}
-      style={
-        isFullscreen && bounds
-          ? {
-              top: bounds.top,
-              left: bounds.left,
-              width: bounds.width,
-              height: bounds.height,
+  const runtimeNode = (
+    <McpAppRuntime
+      toolResourceUri={uiResourceUri}
+      endpoint={
+        appId
+          ? { kind: "app", appId }
+          : {
+              kind: "agent",
+              agentId,
+              serverPrefix: parseFullToolName(toolName).serverName ?? toolName,
             }
+      }
+      displayMode={displayMode}
+      onDisplayModeChange={setDisplayMode}
+      // While portaled into the panel (fill mode), don't report size: that
+      // would overwrite the last inline size and make the card return at the
+      // panel's height when the panel closes.
+      onSizeChange={renderInPanel ? noopSizeChange : setSize}
+      // Seed the iframe + loading box at the last measured inline height so a
+      // reload (e.g. closing the panel re-mounts it) doesn't collapse then grow.
+      inlineInitialHeight={size?.height ?? INITIAL_INLINE_HEIGHT}
+      // Cap the inline chat surface at the card's visual ceiling so a
+      // viewport-relative app can't inflate the iframe without bound. Panel
+      // (fill) and fullscreen stay uncapped.
+      containerDimensions={
+        !renderInPanel && displayMode !== "fullscreen"
+          ? { maxHeight: inlineHeightCap }
           : undefined
       }
-    >
-      {/* Top toolbar — collapses to 0 height when there are no actions to show. */}
-      {(isFullscreen || onShowInSidebar) && (
-        <div
-          className={cn(
-            "flex items-center justify-end gap-1 transition-all duration-300 overflow-hidden",
-            isFullscreen
-              ? "h-12 p-2 border-b opacity-100"
-              : fillContainer
-                ? "h-8 p-1 border-b opacity-100"
-                : "absolute top-1 right-1 z-10 h-7",
-          )}
-        >
-          {onShowInSidebar && (
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              className="h-7 text-xs text-muted-foreground"
-              onClick={onShowInSidebar}
-              aria-label="Show in sidebar"
-              title="Show in sidebar"
-            >
-              Show in sidebar
-            </Button>
-          )}
-          {isFullscreen && (
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon"
-              onClick={onClose}
-              aria-label="Exit fullscreen"
-            >
-              <svg
-                xmlns="http://www.w3.org/2000/svg"
-                width="16"
-                height="16"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                aria-hidden="true"
-              >
-                <path d="M18 6 6 18" />
-                <path d="m6 6 12 12" />
-              </svg>
-            </Button>
-          )}
-        </div>
-      )}
-
-      <div
-        style={
-          fillContainer && !isFullscreen
-            ? undefined
-            : {
-                maxHeight: isFullscreen
-                  ? `${bounds?.height || 1000}px`
-                  : `${clampInlineHeight(size?.height ?? INITIAL_INLINE_HEIGHT, inlineCeiling)}px`,
-              }
-        }
-        className={cn(
-          "transition-[max-height] duration-400 ease-[cubic-bezier(0.23,1,0.32,1)]",
-          isFullscreen
-            ? "flex-1 overflow-hidden [&_iframe]:!w-full [&_iframe]:!h-full [&_iframe]:!min-h-0 [&_iframe]:!max-h-none [&>div]:!h-full"
-            : fillContainer
-              ? "flex-1 min-h-0 overflow-hidden [&_iframe]:!w-full [&_iframe]:!h-full [&_iframe]:!min-h-0 [&_iframe]:!max-h-none [&>div]:!h-full"
-              : "max-w-[80%] shadow-xs border border-border/50 rounded-lg [&_iframe]:!w-full overflow-y-hidden [&_div]:!max-h-none",
-        )}
-      >
-        {children}
-      </div>
-    </div>
+      toolInput={appId ? undefined : toolInput}
+      toolResult={toolResult}
+      preloadedResource={preloadedResource}
+      onResourceStateChange={handleResourceStateChange}
+      onSendMessage={onSendMessage}
+      appVersion={appVersion}
+      reloadNonce={reloadNonce}
+    />
   );
+
+  // Every surface shows the same centered address bar. The owned-app side panel
+  // adds a single settings gear on the right that swaps the body for the inline
+  // settings form; in settings mode the bar becomes cancel/save — a back arrow
+  // (left, discards edits) and a save action (right, submits the form). The
+  // inline chat surface adds the fullscreen-exit (only while fullscreen) and
+  // show-in-panel controls.
+  let topBar: React.ReactNode;
+  let body: React.ReactNode;
+  if (renderInPanel && appId && ownedApp && settingsOpen) {
+    topBar = (
+      <McpAppTopBar
+        left={<McpAppBackButton onClick={() => setSettingsOpen(false)} />}
+        right={
+          <McpAppSaveButton
+            formId={APP_SETTINGS_FORM_ID}
+            disabled={settingsSaveStatus.disabled}
+            saving={settingsSaveStatus.saving}
+          />
+        }
+      >
+        <span className="px-1 text-xs font-medium text-muted-foreground">
+          Settings
+        </span>
+      </McpAppTopBar>
+    );
+    body = (
+      <AppSettingsForm
+        app={ownedApp}
+        onBack={() => setSettingsOpen(false)}
+        formId={APP_SETTINGS_FORM_ID}
+        onStatusChange={setSettingsSaveStatus}
+        onDeleted={closePanel}
+      />
+    );
+  } else {
+    const right =
+      renderInPanel && appId && ownedApp ? (
+        <McpAppSettingsButton onClick={() => setSettingsOpen(true)} />
+      ) : (
+        <>
+          {displayMode === "fullscreen" && (
+            <McpAppFullscreenExitButton onClick={toggleFullscreen} />
+          )}
+          {toolCallId && !renderInPanel && (
+            <McpAppPanelButton onClick={handleShowInPanel} />
+          )}
+        </>
+      );
+    topBar = <McpAppTopBar right={right}>{addressBar}</McpAppTopBar>;
+    body = runtimeNode;
+  }
+
+  const liveSurface = (
+    <McpAppErrorBoundary>
+      <McpAppCard
+        displayMode={displayMode}
+        onToggleFullscreen={toggleFullscreen}
+        diagnostics={diagnosticsBadge}
+        fillContainer={renderInPanel}
+        capInlineHeight
+        topBar={topBar}
+      >
+        {body}
+      </McpAppCard>
+    </McpAppErrorBoundary>
+  );
+
+  const surface = renderInPanel ? (
+    <>
+      <McpAppCard
+        displayMode="inline"
+        onToggleFullscreen={toggleFullscreen}
+        frozenHeight={lastInlineHeightRef.current}
+        capInlineHeight
+        topBar={
+          <McpAppTopBar>
+            <McpAppAddressPill label={headerName} />
+          </McpAppTopBar>
+        }
+        placeholder={
+          <span className="text-muted-foreground">Showing in panel</span>
+        }
+      />
+      {portalTarget && createPortal(liveSurface, portalTarget)}
+    </>
+  ) : (
+    liveSurface
+  );
+
+  return surface;
 }

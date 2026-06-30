@@ -24,7 +24,7 @@ import {
   LocalConfigEnvironmentDefaultSchema,
   SUPPORTED_EMBEDDING_DIMENSIONS,
 } from "@archestra/shared";
-import fastifyCors from "@fastify/cors";
+import fastifyCors, { type FastifyCorsOptions } from "@fastify/cors";
 import fastifyFormbody from "@fastify/formbody";
 import fastifySwagger from "@fastify/swagger";
 import * as Sentry from "@sentry/node";
@@ -55,6 +55,8 @@ import { cacheManager } from "@/cache-manager";
 import config, { shouldRunWebServer, shouldRunWorker } from "@/config";
 import { initializeDatabase, isDatabaseHealthy } from "@/database";
 import { seedRequiredStartingData } from "@/database/seed";
+import { enterpriseTier } from "@/enterprise-tier";
+import { daggerEnvironmentRuntimeManager } from "@/k8s/dagger-environment-runtime/manager";
 import { McpServerRuntimeManager } from "@/k8s/mcp-server-runtime";
 import logger from "@/logging";
 import { enterpriseLicenseMiddleware } from "@/middleware";
@@ -96,6 +98,7 @@ import {
 import websocketService from "@/websocket";
 import * as routes from "./routes";
 import { publicConfigRoutes } from "./routes/config";
+import { createOAuthAwareCorsDelegate } from "./routes/oauth-cors";
 import {
   CONNECTION_SETUP_SCRIPT_PREFIX,
   HEALTH_PATH,
@@ -112,13 +115,11 @@ import {
 const SHUTDOWN_CLEANUP_TIMEOUT_MS = 3000;
 const ACTIVE_CHAT_RUN_REAPER_INTERVAL_MS = 60 * 1000;
 
-// Load enterprise routes if license is activated OR if running in codegen mode
-// (codegen mode ensures OpenAPI spec always includes all enterprise routes)
-const eeRoutes =
-  config.enterpriseFeatures.core || config.codegenMode
-    ? // biome-ignore lint/style/noRestrictedImports: conditional schema
-      await import("./routes/index.ee")
-    : ({} as Record<string, never>);
+// Enterprise routes are always loaded. Access is gated at request time by the
+// EnterpriseTierService, which auto-enables enterprise features for teams below
+// the small-team threshold even when no enterprise license env var is set.
+// biome-ignore lint/style/noRestrictedImports: dual-licensed at request time
+import * as eeRoutes from "./routes/index.ee";
 
 const {
   api: {
@@ -300,6 +301,7 @@ export async function registerWorkerRoutes(fastify: FastifyInstanceWithZod) {
   fastify.register(routes.cerebrasProxyRoutes);
   fastify.register(routes.cohereProxyRoutes);
   fastify.register(routes.deepseekProxyRoutes);
+  fastify.register(routes.githubCopilotProxyRoutes);
   fastify.register(routes.groqProxyRoutes);
   fastify.register(routes.minimaxProxyRoutes);
   fastify.register(routes.modelRouterProxyRoutes);
@@ -371,6 +373,13 @@ export const createFastifyInstance = () =>
     disableRequestLogging: true,
     trustProxy: config.api.trustProxy,
     bodyLimit: config.api.bodyLimit,
+    // Some path params are opaque, base64url-encoded handles longer than
+    // Fastify's 100-char default (e.g. skill-sandbox artifact `obj_` refs that
+    // encode a scope + object key). Without this, such a request fails to match
+    // its route and falls through to the auth hook, surfacing as a 403.
+    routerOptions: {
+      maxParamLength: 4096,
+    },
   })
     .withTypeProvider<ZodTypeProvider>()
     .setValidatorCompiler(validatorCompiler)
@@ -959,6 +968,10 @@ const startWebServer = async () => {
     // Start cache manager's background cleanup interval
     cacheManager.start();
 
+    // Start the enterprise tier service so it has a fresh user count
+    // before the first request hits a license-gated route.
+    await enterpriseTier.start();
+
     // Initialize metrics with keys of custom agent labels
     // Set OpenMetrics content type to enable exemplar support on histograms
     const promClient = await import("prom-client");
@@ -993,6 +1006,10 @@ const startWebServer = async () => {
         "Failed to initialize skill sandbox runtime",
       );
     });
+
+    // Eagerly provision a per-environment Dagger engine + egress policy for every
+    // environment, so environment-bound agents don't route to a non-existent pod.
+    void daggerEnvironmentRuntimeManager.reconcileAll();
 
     // Initialize incoming email provider (if configured)
     // This handles auto-setup of webhook subscription if ARCHESTRA_AGENTS_INCOMING_EMAIL_OUTLOOK_WEBHOOK_URL is set
@@ -1049,8 +1066,19 @@ const startWebServer = async () => {
      */
     await registerMetricsPlugin(fastify, false);
 
-    // Register CORS plugin to allow cross-origin requests
-    await fastify.register(fastifyCors, {
+    // Register CORS plugin to allow cross-origin requests. The policy is
+    // resolved per request:
+    //   - the browser-facing OAuth `authorize` endpoint gets CORS disabled
+    //     (no Access-Control-Allow-Origin): it is only ever a top-level
+    //     navigation carrying the session cookie, so the browser blocks any
+    //     cross-origin fetch while navigation still works — and it needs no
+    //     configured-origin allow-list. See isOAuthAuthorizePath.
+    //   - the public OAuth authorization-server endpoints get a permissive,
+    //     credential-less policy (reflect any origin) so browser-based MCP
+    //     clients on arbitrary origins can complete the OAuth handshake.
+    //   - every other route keeps the restricted, credentialed policy bound to
+    //     the configured origins. See isPublicOAuthCorsPath for the rationale.
+    const restrictedCorsOptions: FastifyCorsOptions = {
       origin: corsOrigins,
       methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
       allowedHeaders: [
@@ -1061,7 +1089,28 @@ const startWebServer = async () => {
       ],
       exposedHeaders: ["Set-Cookie"],
       credentials: true,
-    });
+    };
+    const publicOAuthCorsOptions: FastifyCorsOptions = {
+      origin: true,
+      methods: ["GET", "POST", "OPTIONS"],
+      allowedHeaders: ["Content-Type", "Authorization"],
+      credentials: false,
+    };
+    // `origin: false` makes @fastify/cors emit no Access-Control-Allow-Origin,
+    // which disables CORS for the route: cross-origin fetches are blocked by the
+    // browser, while top-level navigation (how `authorize` is actually reached)
+    // is unaffected.
+    const authorizeDisabledCorsOptions: FastifyCorsOptions = {
+      origin: false,
+    };
+    await fastify.register(
+      fastifyCors,
+      createOAuthAwareCorsDelegate({
+        restricted: restrictedCorsOptions,
+        publicOAuth: publicOAuthCorsOptions,
+        authorizeDisabled: authorizeDisabledCorsOptions,
+      }),
+    );
 
     logger.info(
       {
@@ -1253,6 +1302,7 @@ const startWorker = async () => {
   try {
     await initializeDatabase();
     cacheManager.start();
+    await enterpriseTier.start();
 
     // Sync Archestra MCP branding so the worker recognises branded tool names
     // (e.g. "archestra_staging__artifact_write") when executing scheduled tasks.
@@ -1285,6 +1335,9 @@ const startWorker = async () => {
         "Failed to initialize skill sandbox runtime",
       );
     });
+
+    // Eagerly provision per-environment Dagger engines + egress policies.
+    void daggerEnvironmentRuntimeManager.reconcileAll();
 
     // Worker server for Kubernetes probes, Prometheus scraping,
     // and LLM Proxy / MCP Gateway routes for A2A and scheduled task execution.

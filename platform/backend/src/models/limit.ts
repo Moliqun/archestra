@@ -8,10 +8,12 @@ import type {
   LimitCleanupInterval,
   LimitEntityType,
   LimitType,
+  Model,
   UpdateLimit,
 } from "@/types";
 import AgentModel from "./agent";
 import AgentTeamModel from "./agent-team";
+import EnvironmentDefaultUserLimitModel from "./environment-default-user-limit";
 import ModelModel from "./model";
 
 type LimitsCleanupOptionsEntities = {
@@ -40,6 +42,14 @@ type RollingLimitCleanupInterval = Extract<
 >;
 
 type LimitModelUsageRecord = typeof schema.limitModelUsageTable.$inferSelect;
+
+// Data batch-loaded once per request and shared across the priority-ordered
+// entity checks, so token_cost limit evaluation issues no per-entity queries.
+type LimitPrefetch = {
+  limitsByEntity: Map<string, Limit[]>;
+  usageByLimitId: Map<string, LimitModelUsageRecord[]>;
+  pricingByModelId: Map<string, Model>;
+};
 type LimitViolationResponse = [
   refusalMessage: string,
   contentMessage: string,
@@ -553,6 +563,44 @@ class LimitModel {
     return limits;
   }
 
+  /**
+   * Batched variant of {@link findLimitsForValidation}: fetch the limits for
+   * many (entityType, entityId) pairs in a single query. Used by the LLM-proxy
+   * pre-request check, which inspects limits across several entity levels
+   * (virtual key, user, agent, environment, teams, organization) on every
+   * request — issuing one query per level produced an N+1.
+   */
+  static async findLimitsForValidationForEntities(
+    entities: { entityType: LimitEntityType; entityId: string }[],
+    limitType: LimitType = "token_cost",
+  ): Promise<Limit[]> {
+    const seen = new Set<string>();
+    const entityConditions: SQL[] = [];
+    for (const { entityType, entityId } of entities) {
+      const key = `${entityType}:${entityId}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      entityConditions.push(
+        and(
+          eq(schema.limitsTable.entityType, entityType),
+          eq(schema.limitsTable.entityId, entityId),
+        ) as SQL,
+      );
+    }
+
+    if (entityConditions.length === 0) return [];
+
+    return db
+      .select()
+      .from(schema.limitsTable)
+      .where(
+        and(
+          eq(schema.limitsTable.limitType, limitType),
+          or(...entityConditions),
+        ),
+      );
+  }
+
   // Org-scoped audit snapshot via the entity FK.  limitsTable has no
   // organizationId column of its own, so tenancy is resolved through the
   // entity that owns the limit (organization/team/agent/user/virtual_key).
@@ -596,13 +644,34 @@ class LimitModel {
     };
   }
 
+  // Org-scoped fetch for PATCH/DELETE authorization.  limitsTable has no
+  // organizationId column, so tenancy is resolved through the entity that owns
+  // the limit.  Returns null when the limit does not belong to the caller's
+  // organization (treated as 404 by routes).
+  static async findByIdInOrganization(
+    id: string,
+    organizationId: string,
+  ): Promise<Limit | null> {
+    const limit = await LimitModel.findById(id);
+    if (!limit) return null;
+
+    const inOrg = await LimitModel.isEntityInOrganization(
+      limit.entityType,
+      limit.entityId,
+      organizationId,
+    );
+    return inOrg ? limit : null;
+  }
+
   /**
    * Verify that a limit's entity (the row identified by `entityType` and
    * `entityId`) belongs to `organizationId`.  Each entity type lives in a
    * different table, so the FK path differs per branch.  Used by the
-   * snapshot-before-authz scope predicate in `findByIdForAudit`.
+   * snapshot-before-authz scope predicate in `findByIdForAudit`, by the
+   * org-scoping guards on create/update/delete routes, and by
+   * `findByIdInOrganization`.
    */
-  private static async isEntityInOrganization(
+  static async isEntityInOrganization(
     entityType: LimitEntityType,
     entityId: string,
     organizationId: string,
@@ -655,6 +724,19 @@ class LimitModel {
           .limit(1);
         return Boolean(hit);
       }
+      case "environment": {
+        const [hit] = await db
+          .select({ id: schema.environmentsTable.id })
+          .from(schema.environmentsTable)
+          .where(
+            and(
+              eq(schema.environmentsTable.id, entityId),
+              eq(schema.environmentsTable.organizationId, organizationId),
+            ),
+          )
+          .limit(1);
+        return Boolean(hit);
+      }
     }
   }
 }
@@ -672,8 +754,9 @@ export class LimitValidationService {
     agentId: string;
     userId?: string;
     virtualKeyId?: string;
+    passthroughVirtualKeyId?: string;
   }): Promise<null | LimitViolationResponse> {
-    const { agentId, userId, virtualKeyId } = params;
+    const { agentId, userId, virtualKeyId, passthroughVirtualKeyId } = params;
 
     try {
       logger.debug(
@@ -701,6 +784,10 @@ export class LimitValidationService {
         organizationId = await AgentModel.findOrganizationId(agentId);
       }
 
+      // Resolve the agent's environment (nullable). Used for environment-scoped
+      // limits and per-environment default-user limits.
+      const environmentId = await AgentModel.findEnvironmentId(agentId);
+
       const entities: LimitsCleanupOptionsEntities = {
         agent: agentId,
       };
@@ -716,17 +803,89 @@ export class LimitValidationService {
       if (organizationId) {
         entities.organization = organizationId;
       }
+      if (environmentId) {
+        entities.environment = environmentId;
+      }
 
       logger.debug({ entities }, `[LimitValidation] Running limits cleanup`);
       await LimitModel.cleanupLimitsIfNeeded({ entities });
+      if (passthroughVirtualKeyId) {
+        // Cleanup expired windows for the passthrough key too (the cleanup
+        // entities map holds a single virtual_key slot).
+        await LimitModel.cleanupLimitsIfNeeded({
+          entities: { virtual_key: passthroughVirtualKeyId },
+        });
+      }
+
+      // Prefetch every limit, per-model usage row, and model price the priority
+      // checks below may need, in a fixed set of batched queries. Each entity
+      // level used to issue its own limit_model_usage + models lookups, which
+      // showed up as an N+1 on LLM-proxy requests. Built AFTER cleanup so the
+      // usage rows reflect any windows that were just reset.
+      const entitiesToCheck: {
+        entityType: LimitEntityType;
+        entityId: string;
+      }[] = [];
+      if (passthroughVirtualKeyId) {
+        entitiesToCheck.push({
+          entityType: "virtual_key",
+          entityId: passthroughVirtualKeyId,
+        });
+      }
+      if (virtualKeyId) {
+        entitiesToCheck.push({
+          entityType: "virtual_key",
+          entityId: virtualKeyId,
+        });
+      }
+      if (userId) {
+        entitiesToCheck.push({ entityType: "user", entityId: userId });
+      }
+      entitiesToCheck.push({ entityType: "agent", entityId: agentId });
+      if (environmentId) {
+        entitiesToCheck.push({
+          entityType: "environment",
+          entityId: environmentId,
+        });
+      }
+      for (const team of agentTeams) {
+        entitiesToCheck.push({ entityType: "team", entityId: team.id });
+      }
+      if (organizationId) {
+        entitiesToCheck.push({
+          entityType: "organization",
+          entityId: organizationId,
+        });
+      }
+      const prefetch =
+        await LimitValidationService.prefetchEntityLimits(entitiesToCheck);
+
+      // The passthrough key is the user-bound cost-bearing identity, so its
+      // per-key limit is checked first and takes precedence over the standard
+      // virtual key when both are present on the request.
+      if (passthroughVirtualKeyId) {
+        const passthroughLimitViolation =
+          LimitValidationService.evaluateEntityLimits(
+            "virtual_key",
+            passthroughVirtualKeyId,
+            prefetch,
+          );
+        if (passthroughLimitViolation) {
+          logger.info(
+            `[LimitValidation] BLOCKED by passthrough virtual-key-level limit for: ${passthroughVirtualKeyId}`,
+          );
+          return passthroughLimitViolation;
+        }
+      }
 
       if (virtualKeyId) {
         logger.debug(
           `[LimitValidation] Checking virtual-key-level limits for: ${virtualKeyId}`,
         );
-        const vkLimitViolation = await LimitValidationService.checkEntityLimits(
+        const vkLimitViolation = LimitValidationService.evaluateEntityLimits(
           "virtual_key",
           virtualKeyId,
+          prefetch,
         );
         if (vkLimitViolation) {
           logger.info(
@@ -743,8 +902,11 @@ export class LimitValidationService {
         logger.debug(
           `[LimitValidation] Checking user-level limits for: ${userId}`,
         );
-        const userLimitViolation =
-          await LimitValidationService.checkEntityLimits("user", userId);
+        const userLimitViolation = LimitValidationService.evaluateEntityLimits(
+          "user",
+          userId,
+          prefetch,
+        );
         if (userLimitViolation) {
           logger.info(
             `[LimitValidation] BLOCKED by user-level limit for: ${userId}`,
@@ -756,6 +918,7 @@ export class LimitValidationService {
             await LimitValidationService.checkDefaultUserLimit({
               organizationId,
               userId,
+              environmentId,
             });
           if (defaultUserLimitViolation) {
             logger.info(
@@ -770,8 +933,11 @@ export class LimitValidationService {
       logger.debug(
         `[LimitValidation] Checking agent-level limits for: ${agentId}`,
       );
-      const agentLimitViolation =
-        await LimitValidationService.checkEntityLimits("agent", agentId);
+      const agentLimitViolation = LimitValidationService.evaluateEntityLimits(
+        "agent",
+        agentId,
+        prefetch,
+      );
       if (agentLimitViolation) {
         logger.info(
           `[LimitValidation] BLOCKED by agent-level limit for: ${agentId}`,
@@ -779,6 +945,29 @@ export class LimitValidationService {
         return agentLimitViolation;
       }
       logger.debug(`[LimitValidation] Agent-level limits OK for: ${agentId}`);
+
+      // Check environment-level limits (total usage across all users in the
+      // agent's environment).
+      if (environmentId) {
+        logger.debug(
+          `[LimitValidation] Checking environment-level limits for: ${environmentId}`,
+        );
+        const environmentLimitViolation =
+          LimitValidationService.evaluateEntityLimits(
+            "environment",
+            environmentId,
+            prefetch,
+          );
+        if (environmentLimitViolation) {
+          logger.info(
+            `[LimitValidation] BLOCKED by environment-level limit for: ${environmentId}`,
+          );
+          return environmentLimitViolation;
+        }
+        logger.debug(
+          `[LimitValidation] Environment-level limits OK for: ${environmentId}`,
+        );
+      }
 
       // Check team-level limits
       if (agentTeamIds.length > 0) {
@@ -794,7 +983,11 @@ export class LimitValidationService {
             `[LimitValidation] Checking team limit for team: ${team.id}`,
           );
           const teamLimitViolation =
-            await LimitValidationService.checkEntityLimits("team", team.id);
+            LimitValidationService.evaluateEntityLimits(
+              "team",
+              team.id,
+              prefetch,
+            );
           if (teamLimitViolation) {
             logger.info(
               `[LimitValidation] BLOCKED by team-level limit for team: ${team.id}`,
@@ -812,11 +1005,11 @@ export class LimitValidationService {
         logger.debug(
           `[LimitValidation] Checking organization-level limits for org: ${organizationId}`,
         );
-        const orgLimitViolation =
-          await LimitValidationService.checkEntityLimits(
-            "organization",
-            organizationId,
-          );
+        const orgLimitViolation = LimitValidationService.evaluateEntityLimits(
+          "organization",
+          organizationId,
+          prefetch,
+        );
         if (orgLimitViolation) {
           logger.info(
             `[LimitValidation] BLOCKED by organization-level limit for org: ${organizationId}`,
@@ -842,136 +1035,145 @@ export class LimitValidationService {
   }
 
   /**
-   * Check if current token cost usage has exceeded limits for a specific entity
+   * Batch-load the limits, per-model usage rows, and model prices needed to
+   * evaluate token_cost limits for a set of entities. Collapses what used to be
+   * a per-entity/per-limit set of queries into three queries total.
    */
-  private static async checkEntityLimits(
+  private static async prefetchEntityLimits(
+    entities: { entityType: LimitEntityType; entityId: string }[],
+  ): Promise<LimitPrefetch> {
+    const limits = await LimitModel.findLimitsForValidationForEntities(
+      entities,
+      "token_cost",
+    );
+
+    const limitsByEntity = new Map<string, Limit[]>();
+    for (const limit of limits) {
+      const key = `${limit.entityType}:${limit.entityId}`;
+      const existing = limitsByEntity.get(key);
+      if (existing) existing.push(limit);
+      else limitsByEntity.set(key, [limit]);
+    }
+
+    const usageByLimitId = new Map<string, LimitModelUsageRecord[]>();
+    if (limits.length > 0) {
+      const usageRows = await db
+        .select()
+        .from(schema.limitModelUsageTable)
+        .where(
+          inArray(
+            schema.limitModelUsageTable.limitId,
+            limits.map((limit) => limit.id),
+          ),
+        );
+      for (const row of usageRows) {
+        const existing = usageByLimitId.get(row.limitId);
+        if (existing) existing.push(row);
+        else usageByLimitId.set(row.limitId, [row]);
+      }
+    }
+
+    const modelIds = new Set<string>();
+    for (const rows of usageByLimitId.values()) {
+      for (const row of rows) modelIds.add(row.model);
+    }
+    const pricingByModelId = await ModelModel.findByModelIdsOnly(
+      Array.from(modelIds),
+    );
+
+    return { limitsByEntity, usageByLimitId, pricingByModelId };
+  }
+
+  /**
+   * Check if current token cost usage has exceeded limits for a specific entity,
+   * using data already loaded by {@link prefetchEntityLimits}. Pure in-memory
+   * evaluation — issues no queries of its own.
+   */
+  private static evaluateEntityLimits(
     entityType: LimitEntityType,
     entityId: string,
-  ): Promise<null | LimitViolationResponse> {
-    try {
+    prefetch: LimitPrefetch,
+  ): null | LimitViolationResponse {
+    const limits =
+      prefetch.limitsByEntity.get(`${entityType}:${entityId}`) ?? [];
+
+    if (limits.length === 0) {
       logger.debug(
-        `[LimitValidation] Querying limits for ${entityType} ${entityId}`,
+        `[LimitValidation] No token_cost limits found for ${entityType} ${entityId} - allowing`,
       );
-      const limits = await LimitModel.findLimitsForValidation(
-        entityType,
-        entityId,
-        "token_cost",
-      );
-
-      logger.debug(
-        `[LimitValidation] Found ${limits.length} token_cost limits for ${entityType} ${entityId}`,
-      );
-
-      if (limits.length === 0) {
-        logger.debug(
-          `[LimitValidation] No token_cost limits found for ${entityType} ${entityId} - allowing`,
-        );
-        return null;
-      }
-
-      for (const limit of limits) {
-        logger.debug(
-          `[LimitValidation] Checking limit ${limit.id} for ${entityType} ${entityId}`,
-        );
-
-        // For token_cost limits, convert tokens to actual cost using token prices
-        let comparisonValue = 0;
-        let limitDescription: "tokens" | "cost_dollars" = "tokens";
-        let totalTokensIn = 0;
-        let totalTokensOut = 0;
-
-        if (limit.limitType === "token_cost") {
-          try {
-            // Get per-model usage from limit_model_usage table
-            const modelUsages = await db
-              .select()
-              .from(schema.limitModelUsageTable)
-              .where(eq(schema.limitModelUsageTable.limitId, limit.id));
-
-            if (modelUsages.length === 0) {
-              logger.warn(
-                `[LimitValidation] No model usage records found for limit ${limit.id}`,
-              );
-              comparisonValue = 0;
-            } else {
-              const usageCosts = await calculateModelUsageCosts(modelUsages);
-              for (const usage of usageCosts.breakdown) {
-                logger.debug(
-                  `[LimitValidation] Model ${usage.model}: ${usage.tokensIn} in + ${usage.tokensOut} out = $${usage.cost.toFixed(2)}`,
-                );
-              }
-
-              totalTokensIn = usageCosts.tokensIn;
-              totalTokensOut = usageCosts.tokensOut;
-              comparisonValue = usageCosts.cost;
-              limitDescription = "cost_dollars";
-
-              logger.debug(
-                `[LimitValidation] Total cost for limit ${limit.id}: $${usageCosts.cost.toFixed(2)} across ${modelUsages.length} models`,
-              );
-            }
-          } catch (error) {
-            logger.error(
-              `[LimitValidation] Error calculating cost for limit ${limit.id}: ${error}`,
-            );
-          }
-        }
-
-        if (comparisonValue >= limit.limitValue) {
-          logger.info(
-            `[LimitValidation] LIMIT EXCEEDED for ${entityType} ${entityId}: ${comparisonValue} ${limitDescription} >= ${limit.limitValue}`,
-          );
-
-          return buildLimitViolationResponse({
-            entityType,
-            entityId,
-            limitValue: limit.limitValue,
-            comparisonValue,
-            limitDescription,
-            totalTokensIn,
-            totalTokensOut,
-          });
-        } else {
-          logger.debug(
-            `[LimitValidation] Limit OK for ${entityType} ${entityId}: ${comparisonValue} < ${limit.limitValue}`,
-          );
-        }
-      }
-
-      logger.info(
-        `[LimitValidation] All ${limits.length} limits OK for ${entityType} ${entityId}`,
-      );
-      return null; // No limits exceeded for this entity
-    } catch (error) {
-      logger.error(
-        `[LimitValidation] Error checking ${entityType} limits for ${entityId}: ${error}`,
-      );
-      return null; // Allow request on error
+      return null;
     }
+
+    for (const limit of limits) {
+      logger.debug(
+        `[LimitValidation] Checking limit ${limit.id} for ${entityType} ${entityId}`,
+      );
+
+      // For token_cost limits, convert tokens to actual cost using token prices
+      let comparisonValue = 0;
+      let limitDescription: "tokens" | "cost_dollars" = "tokens";
+      let totalTokensIn = 0;
+      let totalTokensOut = 0;
+
+      if (limit.limitType === "token_cost") {
+        const modelUsages = prefetch.usageByLimitId.get(limit.id) ?? [];
+
+        if (modelUsages.length === 0) {
+          logger.warn(
+            `[LimitValidation] No model usage records found for limit ${limit.id}`,
+          );
+        } else {
+          const usageCosts = computeModelUsageCosts(
+            modelUsages,
+            prefetch.pricingByModelId,
+          );
+
+          totalTokensIn = usageCosts.tokensIn;
+          totalTokensOut = usageCosts.tokensOut;
+          comparisonValue = usageCosts.cost;
+          limitDescription = "cost_dollars";
+
+          logger.debug(
+            `[LimitValidation] Total cost for limit ${limit.id}: $${usageCosts.cost.toFixed(2)} across ${modelUsages.length} models`,
+          );
+        }
+      }
+
+      if (comparisonValue >= limit.limitValue) {
+        logger.info(
+          `[LimitValidation] LIMIT EXCEEDED for ${entityType} ${entityId}: ${comparisonValue} ${limitDescription} >= ${limit.limitValue}`,
+        );
+
+        return buildLimitViolationResponse({
+          entityType,
+          entityId,
+          limitValue: limit.limitValue,
+          comparisonValue,
+          limitDescription,
+          totalTokensIn,
+          totalTokensOut,
+        });
+      }
+
+      logger.debug(
+        `[LimitValidation] Limit OK for ${entityType} ${entityId}: ${comparisonValue} < ${limit.limitValue}`,
+      );
+    }
+
+    logger.info(
+      `[LimitValidation] All ${limits.length} limits OK for ${entityType} ${entityId}`,
+    );
+    return null; // No limits exceeded for this entity
   }
 
   private static async checkDefaultUserLimit(params: {
     organizationId: string;
     userId: string;
+    environmentId?: string | null;
   }): Promise<null | LimitViolationResponse> {
     try {
-      const [organization] = await db
-        .select({
-          defaultUserLimitValue:
-            schema.organizationsTable.defaultUserLimitValue,
-          defaultUserLimitModel:
-            schema.organizationsTable.defaultUserLimitModel,
-          defaultUserLimitCleanupInterval:
-            schema.organizationsTable.defaultUserLimitCleanupInterval,
-        })
-        .from(schema.organizationsTable)
-        .where(eq(schema.organizationsTable.id, params.organizationId))
-        .limit(1);
-
-      if (!organization?.defaultUserLimitValue) {
-        return null;
-      }
-
+      // A custom per-user limit always wins and disables every default
+      // (org-wide and per-environment) for that user.
       const customUserLimits = await LimitModel.findLimitsForValidation(
         "user",
         params.userId,
@@ -984,23 +1186,64 @@ export class LimitValidationService {
         return null;
       }
 
+      // A per-environment default overrides the org-wide default for requests in
+      // that environment; environments without one fall back to the org-wide
+      // default below.
+      if (params.environmentId) {
+        const envDefault =
+          await EnvironmentDefaultUserLimitModel.findByEnvironmentId(
+            params.environmentId,
+          );
+        if (envDefault) {
+          const usage = await getDefaultUserLimitUsage({
+            organizationId: params.organizationId,
+            userId: params.userId,
+            environmentId: params.environmentId,
+            models: normalizeLimitModels(envDefault.model),
+            cleanupInterval: envDefault.cleanupInterval,
+          });
+
+          if (usage.cost < envDefault.limitValue) {
+            return null;
+          }
+
+          return buildLimitViolationResponse({
+            entityType: "environment",
+            entityId: params.environmentId,
+            limitValue: envDefault.limitValue,
+            comparisonValue: usage.cost,
+            limitDescription: "cost_dollars",
+            totalTokensIn: usage.tokensIn,
+            totalTokensOut: usage.tokensOut,
+          });
+        }
+      }
+
+      // The organization-wide default is the NULL-environment row in the
+      // unified default-user-limits store. Its usage spans the user's whole org
+      // (no environment filter).
+      const globalDefault = await EnvironmentDefaultUserLimitModel.findGlobal(
+        params.organizationId,
+      );
+      if (!globalDefault) {
+        return null;
+      }
+
       const usage = await getDefaultUserLimitUsage({
         organizationId: params.organizationId,
         userId: params.userId,
-        models: normalizeLimitModels(organization.defaultUserLimitModel),
-        cleanupInterval:
-          organization.defaultUserLimitCleanupInterval ??
-          DEFAULT_LIMIT_CLEANUP_INTERVAL,
+        models: normalizeLimitModels(globalDefault.model),
+        cleanupInterval: globalDefault.cleanupInterval,
       });
 
-      if (usage.cost < organization.defaultUserLimitValue) {
+      if (usage.cost < globalDefault.limitValue) {
         return null;
       }
 
       return buildLimitViolationResponse({
         entityType: "user",
         entityId: params.userId,
-        limitValue: organization.defaultUserLimitValue,
+        limitValue: globalDefault.limitValue,
         comparisonValue: usage.cost,
         limitDescription: "cost_dollars",
         totalTokensIn: usage.tokensIn,
@@ -1062,6 +1305,14 @@ function buildOrganizationLimitScopeCondition(organizationId: string): SQL {
         SELECT 1 FROM ${schema.virtualApiKeysTable}
         WHERE ${schema.virtualApiKeysTable.id}::text = ${schema.limitsTable.entityId}
           AND ${schema.virtualApiKeysTable.organizationId} = ${organizationId}
+      )`,
+    ),
+    and(
+      eq(schema.limitsTable.entityType, "environment"),
+      sql`EXISTS (
+        SELECT 1 FROM ${schema.environmentsTable}
+        WHERE ${schema.environmentsTable.id}::text = ${schema.limitsTable.entityId}
+          AND ${schema.environmentsTable.organizationId} = ${organizationId}
       )`,
     ),
   ) as SQL;
@@ -1141,6 +1392,16 @@ async function calculateModelUsageCosts(modelUsages: LimitModelUsageRecord[]) {
     Array.from(new Set(modelUsages.map((usage) => usage.model))),
   );
 
+  return computeModelUsageCosts(modelUsages, modelEntriesByModelId);
+}
+
+// Pure cost computation given already-loaded model pricing. Split out from
+// calculateModelUsageCosts so the LLM-proxy pre-request check can evaluate many
+// limits against a single batched price lookup instead of querying per limit.
+function computeModelUsageCosts(
+  modelUsages: LimitModelUsageRecord[],
+  modelEntriesByModelId: Map<string, Model>,
+) {
   let cost = 0;
   let tokensIn = 0;
   let tokensOut = 0;
@@ -1174,11 +1435,10 @@ async function getDefaultUserLimitUsage(params: {
   userId: string;
   models: string[] | null;
   cleanupInterval: LimitCleanupInterval;
+  environmentId?: string | null;
 }) {
   const conditions: SQL[] = [
     eq(schema.interactionsTable.userId, params.userId),
-    eq(schema.agentsTable.organizationId, params.organizationId),
-    notDeleted(schema.agentsTable),
     buildUsagePeriodStartCondition(params.cleanupInterval),
   ];
 
@@ -1188,19 +1448,42 @@ async function getDefaultUserLimitUsage(params: {
     );
   }
 
-  const interactions = await db
-    .select({
-      model: schema.interactionsTable.model,
-      cost: schema.interactionsTable.cost,
-      inputTokens: schema.interactionsTable.inputTokens,
-      outputTokens: schema.interactionsTable.outputTokens,
-    })
-    .from(schema.interactionsTable)
-    .innerJoin(
-      schema.agentsTable,
-      eq(schema.interactionsTable.profileId, schema.agentsTable.id),
-    )
-    .where(and(...conditions));
+  const selection = {
+    model: schema.interactionsTable.model,
+    cost: schema.interactionsTable.cost,
+    inputTokens: schema.interactionsTable.inputTokens,
+    outputTokens: schema.interactionsTable.outputTokens,
+  };
+
+  // Environment-scoped usage filters on the environment snapshotted on the
+  // interaction at request time. An environment belongs to exactly one org, so
+  // this already scopes to the org without joining the agent — and, like the
+  // incremental environment counter, it must count usage even after the
+  // originating agent is deleted (no `notDeleted(agent)` join).
+  const interactions = params.environmentId
+    ? await db
+        .select(selection)
+        .from(schema.interactionsTable)
+        .where(
+          and(
+            ...conditions,
+            eq(schema.interactionsTable.environmentId, params.environmentId),
+          ),
+        )
+    : await db
+        .select(selection)
+        .from(schema.interactionsTable)
+        .innerJoin(
+          schema.agentsTable,
+          eq(schema.interactionsTable.profileId, schema.agentsTable.id),
+        )
+        .where(
+          and(
+            ...conditions,
+            eq(schema.agentsTable.organizationId, params.organizationId),
+            notDeleted(schema.agentsTable),
+          ),
+        );
 
   const modelsMissingCost = Array.from(
     new Set(

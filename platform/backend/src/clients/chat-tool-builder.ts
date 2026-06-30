@@ -27,9 +27,13 @@ import {
   archestraMcpBranding,
   executeArchestraTool,
 } from "@/archestra-mcp-server";
-import { isToolGrantApprovable } from "@/archestra-mcp-server/tool-auto-assign";
+import { resolveRunToolTarget } from "@/archestra-mcp-server/run-tool-target";
 import type { ChatMcpElicitationBridge } from "@/clients/chat-mcp-elicitation";
 import mcpClient, { type TokenAuthContext } from "@/clients/mcp-client";
+import type {
+  RepeatSeverity,
+  ToolCallRepeatTracker,
+} from "@/clients/tool-call-repeat-tracker";
 import { hookDispatcherService } from "@/hooks/hook-dispatcher-service";
 import { type CollectedHookRun, toCollectedRuns } from "@/hooks/hook-run-parts";
 import logger from "@/logging";
@@ -41,8 +45,16 @@ import {
   type SpanTeamInfo,
   startActiveMcpSpan,
 } from "@/observability/tracing";
-import type { GlobalToolPolicy, UnsafeContextBoundary } from "@/types";
-import { agentOwner, UNSAFE_CONTEXT_BOUNDARY_REASON } from "@/types";
+import type {
+  DiscoveredToolPolicy,
+  GlobalToolPolicy,
+  UnsafeContextBoundary,
+} from "@/types";
+import {
+  agentOwner,
+  defaultDiscoveredToolPolicy,
+  UNSAFE_CONTEXT_BOUNDARY_REASON,
+} from "@/types";
 
 /** Gateway token selected for the current call (see selectMCPGatewayToken). */
 export interface McpGatewayToken {
@@ -86,7 +98,14 @@ export interface ChatToolContext {
   hookRunCollector?: CollectedHookRun[];
   mcpGwToken: McpGatewayToken;
   globalToolPolicy: GlobalToolPolicy;
+  discoveredToolPolicy: DiscoveredToolPolicy;
   considerContextUntrusted: boolean;
+  /**
+   * Per-run guard against the model re-issuing the identical tool call forever.
+   * One instance per getChatMcpTools call (shared by every tool wrapper), so it
+   * carries no cross-run state.
+   */
+  repeatTracker: ToolCallRepeatTracker;
 }
 
 /**
@@ -107,7 +126,6 @@ export function buildMcpGatewayTool(params: {
     ...needsApprovalProps({
       toolName: mcpTool.name,
       ctx,
-      allowRunToolGrant: true,
     }),
     execute: async (args: unknown, options) => {
       const toolArguments = isRecord(args) ? args : undefined;
@@ -120,6 +138,17 @@ export function buildMcpGatewayTool(params: {
         abortLogMessage: "MCP tool execution aborted",
         failureLogMessage: "MCP tool execution failed",
         run: async ({ span, startTime }) => {
+          const repeatNudge = applyRepeatedCallBreaker({
+            ctx,
+            toolName: mcpTool.name,
+            toolArguments,
+            span,
+            startTime,
+          });
+          if (repeatNudge !== null) {
+            return repeatNudge;
+          }
+
           // PreToolUse lifecycle hook: a block short-circuits execution
           // and returns an explanatory tool-result instead of running.
           const preBlockReason = await firePreToolUseHook({
@@ -141,7 +170,6 @@ export function buildMcpGatewayTool(params: {
           }
 
           let toolResult: string | { content: string; [key: string]: unknown };
-          // Check if this is an Archestra tool - handle directly without DB lookup
           if (archestraMcpBranding.isToolName(mcpTool.name)) {
             logger.debug(
               {
@@ -178,6 +206,7 @@ export function buildMcpGatewayTool(params: {
                 sessionId: ctx.sessionId,
                 scheduleTriggerRunId: ctx.scheduleTriggerRunId,
                 abortSignal: ctx.abortSignal,
+                elicitation: ctx.elicitation,
                 contextIsTrusted: toolExecutionContext.contextIsTrusted,
                 approvalRequiredPoliciesHandled: true,
                 tokenAuth: buildTokenAuthContext({
@@ -274,7 +303,6 @@ export function buildAgentDelegationTool(params: {
     chatOpsThreadId: ctx.chatOpsThreadId,
     sessionId: ctx.sessionId,
     scheduleTriggerRunId: ctx.scheduleTriggerRunId,
-    // Pass delegation chain for tracking delegated agent calls
     delegationChain: ctx.delegationChain,
     abortSignal: ctx.abortSignal,
     tokenAuth: buildTokenAuthContext({
@@ -290,7 +318,6 @@ export function buildAgentDelegationTool(params: {
     ...needsApprovalProps({
       toolName: agentTool.name,
       ctx,
-      allowRunToolGrant: false,
     }),
     execute: async (args: Record<string, unknown>, options) =>
       executeWithToolSpan({
@@ -302,6 +329,19 @@ export function buildAgentDelegationTool(params: {
         abortLogMessage: "Agent tool execution aborted",
         failureLogMessage: "Agent tool execution failed",
         run: async ({ span, startTime }) => {
+          // Repeated identical delegation calls loop too — and each one spawns a
+          // child-agent run, so breaking the loop here matters more, not less.
+          const repeatNudge = applyRepeatedCallBreaker({
+            ctx,
+            toolName: agentTool.name,
+            toolArguments: args,
+            span,
+            startTime,
+          });
+          if (repeatNudge !== null) {
+            return repeatNudge;
+          }
+
           const toolExecutionContext = await evaluateToolExecutionContextTrust({
             messages: options.messages,
             agentId: ctx.agentId,
@@ -544,47 +584,24 @@ function getChatExternalAgentId(): string {
 function needsApprovalProps(params: {
   toolName: string;
   ctx: ChatToolContext;
-  /** Only run_tool can propose granting an accessible-but-unassigned target. */
-  allowRunToolGrant: boolean;
 }): Pick<Tool, "needsApproval"> | Record<string, never> {
-  const { toolName, ctx, allowRunToolGrant } = params;
+  const { toolName, ctx } = params;
   if (ctx.blockOnApprovalRequired) {
     return {};
   }
   return {
     needsApproval: async (args: unknown) => {
       const approvalTarget = resolveApprovalPolicyTarget(toolName, args);
-      if (
-        await ToolInvocationPolicyModel.checkApprovalRequired(
-          approvalTarget.toolName,
-          approvalTarget.toolInput,
-          {
-            teamIds: [],
-            externalAgentId: getChatExternalAgentId(),
-          },
-          ctx.globalToolPolicy,
-        )
-      ) {
-        return true;
-      }
-      // Grant approval: only run_tool can target a tool the agent
-      // does not yet have. Propose granting an accessible-but-
-      // unassigned target so the user confirms (and the tool is added
-      // to the agent) before it runs. The frontend assigns the tool,
-      // then resumes this same call — by which point it is assigned.
-      if (
-        !allowRunToolGrant ||
-        archestraMcpBranding.getToolShortName(toolName) !==
-          TOOL_RUN_TOOL_SHORT_NAME
-      ) {
-        return false;
-      }
-      return isToolGrantApprovable({
-        toolName: approvalTarget.toolName,
-        agentId: ctx.agentId,
-        userId: ctx.userId,
-        organizationId: ctx.organizationId,
-      });
+      return ToolInvocationPolicyModel.checkApprovalRequired(
+        approvalTarget.toolName,
+        approvalTarget.toolInput,
+        {
+          teamIds: [],
+          externalAgentId: getChatExternalAgentId(),
+        },
+        ctx.globalToolPolicy,
+        ctx.discoveredToolPolicy,
+      );
     },
   };
 }
@@ -621,7 +638,12 @@ async function executeWithToolSpan<R>(params: {
   } = params;
 
   if (ctx.blockOnApprovalRequired) {
-    await throwIfApprovalRequired(toolName, args, ctx.globalToolPolicy);
+    await throwIfApprovalRequired(
+      toolName,
+      args,
+      ctx.globalToolPolicy,
+      ctx.discoveredToolPolicy,
+    );
   }
 
   logger.info(
@@ -646,13 +668,17 @@ async function executeWithToolSpan<R>(params: {
         throwIfAborted(ctx.abortSignal);
         return await run({ span, startTime });
       } catch (error) {
-        reportToolMetrics({
-          toolName,
-          agentId: ctx.agentId,
-          agentName: ctx.agentName,
-          startTime,
-          isError: true,
-        });
+        const aborted = ctx.abortSignal?.aborted || isAbortLikeError(error);
+        // A stopped run is a cancellation, not a tool failure — don't count it.
+        if (!aborted) {
+          reportToolMetrics({
+            toolName,
+            agentId: ctx.agentId,
+            agentName: ctx.agentName,
+            startTime,
+            isError: true,
+          });
+        }
         const logPayload = {
           agentId: ctx.agentId,
           userId: ctx.userId,
@@ -660,7 +686,7 @@ async function executeWithToolSpan<R>(params: {
           err: error,
           errorMessage: error instanceof Error ? error.message : String(error),
         };
-        if (isAbortLikeError(error)) {
+        if (aborted) {
           logger.info(logPayload, abortLogMessage);
         } else {
           logger.error(logPayload, failureLogMessage);
@@ -758,7 +784,6 @@ async function executeMcpTool(ctx: ToolExecutionContext): Promise<{
     }
   }
 
-  // Execute via mcpClient
   const toolCall = {
     id: randomUUID(),
     name: toolName,
@@ -783,6 +808,10 @@ async function executeMcpTool(ctx: ToolExecutionContext): Promise<{
         // mcp-client scopes per-conversation sessions by this key; in UI chat it
         // is the conversation id, in headless executions the execution key.
         conversationId: isolationKey,
+        // Cancels the in-flight upstream call when the chat run is stopped,
+        // instead of letting it run to completion past the post-call
+        // throwIfAborted below. Covers subagents too (shared builder).
+        abortSignal,
         ...(elicitation
           ? { elicitationHandler: elicitation.createHandler({ toolName }) }
           : {}),
@@ -796,13 +825,17 @@ async function executeMcpTool(ctx: ToolExecutionContext): Promise<{
       isError: result.isError ?? false,
     });
   } catch (error) {
-    reportToolMetrics({
-      toolName,
-      agentId,
-      agentName,
-      startTime,
-      isError: true,
-    });
+    // A stopped run aborts the call mid-flight; that is a cancellation, not a
+    // tool failure, so don't count it as an error.
+    if (!abortSignal?.aborted) {
+      reportToolMetrics({
+        toolName,
+        agentId,
+        agentName,
+        startTime,
+        isError: true,
+      });
+    }
     throw error;
   }
   throwIfAborted(abortSignal);
@@ -837,7 +870,6 @@ async function executeMcpTool(ctx: ToolExecutionContext): Promise<{
     };
   }
 
-  // Sync browser state if needed
   logger.debug(
     { isolationKey, toolName, isEnabled: browserStreamFeature.isEnabled() },
     "[executeMcpTool] Checking browser sync conditions",
@@ -1120,6 +1152,12 @@ async function throwIfApprovalRequired(
   toolName: string,
   args: unknown,
   globalToolPolicy: GlobalToolPolicy,
+  // Defaults to the discovered-tool equivalent of globalToolPolicy so callers
+  // that don't distinguish discovered tools keep single-policy behavior; the
+  // chat path passes it explicitly.
+  discoveredToolPolicy: DiscoveredToolPolicy = defaultDiscoveredToolPolicy(
+    globalToolPolicy,
+  ),
 ): Promise<void> {
   const approvalTarget = resolveApprovalPolicyTarget(toolName, args);
   const requiresApproval =
@@ -1131,6 +1169,7 @@ async function throwIfApprovalRequired(
         externalAgentId: getChatExternalAgentId(),
       },
       globalToolPolicy,
+      discoveredToolPolicy,
     );
   if (requiresApproval) {
     throw new Error(TOOL_INVOCATION_APPROVAL_REQUIRED_AUTONOMOUS_REASON);
@@ -1141,24 +1180,7 @@ function resolveApprovalPolicyTarget(
   toolName: string,
   args: unknown,
 ): { toolName: string; toolInput: Record<string, unknown> } {
-  const toolInput = isRecord(args) ? args : {};
-  const shortName = archestraMcpBranding.getToolShortName(toolName);
-  if (shortName !== TOOL_RUN_TOOL_SHORT_NAME) {
-    return { toolName, toolInput };
-  }
-
-  const targetToolName = toolInput.tool_name;
-  if (typeof targetToolName !== "string" || targetToolName.length === 0) {
-    return { toolName, toolInput };
-  }
-
-  const targetToolInput = isRecord(toolInput.tool_args)
-    ? toolInput.tool_args
-    : {};
-  return {
-    toolName: targetToolName,
-    toolInput: targetToolInput,
-  };
+  return resolveRunToolTarget(toolName, args);
 }
 
 function reportToolMetrics(params: {
@@ -1249,6 +1271,69 @@ async function firePreToolUseHook(params: {
 /** Tool-result text returned to the model when a PreToolUse hook blocks a call. */
 function buildPreToolUseBlockedResult(reason: string | null): string {
   return `Tool call blocked by a PreToolUse hook. Reason: ${reason ?? "no reason given"}. Do not retry; explain the block to the user.`;
+}
+
+/**
+ * Tool-result text returned in place of executing a tool call that has repeated
+ * with identical arguments past the threshold (see ToolCallRepeatTracker). The
+ * call is not executed; this message replaces its result. At the termination
+ * tier the run is also stopped (see repeatCeilingStopCondition), so this text is
+ * the last recorded content and states why the run ended.
+ */
+function buildRepeatedCallNudge(
+  toolName: string,
+  count: number,
+  severity: RepeatSeverity,
+): string {
+  if (severity === "terminate") {
+    return `You have called \`${toolName}\` with identical arguments ${count} times in a row despite earlier nudges, so the run is being stopped — repeating it cannot produce a different result.`;
+  }
+  return `You have called \`${toolName}\` with identical arguments ${count} times in a row, so it was not executed again — repeating it will not produce a different result. Change the arguments, use a different tool, or give your best final answer with what you already know.`;
+}
+
+/**
+ * Circuit breaker for repeated identical tool calls. Records the call on the
+ * per-run tracker and, once the same (tool + args) repeats past the threshold,
+ * returns the nudge text to use in place of executing the tool; returns null
+ * below the threshold so the caller proceeds normally. A skip is reported as a
+ * non-error tool call: nothing failed — the loop was just short-circuited — so
+ * it must not inflate tool error metrics. Shared by the MCP and delegation
+ * tool wrappers, which hold one tracker per run via ctx.
+ */
+function applyRepeatedCallBreaker(params: {
+  ctx: ChatToolContext;
+  toolName: string;
+  toolArguments: Record<string, unknown> | undefined;
+  span: Parameters<Parameters<typeof startActiveMcpSpan>[0]["callback"]>[0];
+  startTime: number;
+}): string | null {
+  const { ctx, toolName, toolArguments, span, startTime } = params;
+  const repeat = ctx.repeatTracker.record(toolName, toolArguments);
+  if (!repeat.shouldNudge) {
+    return null;
+  }
+  logger.warn(
+    {
+      agentId: ctx.agentId,
+      conversationId: ctx.conversationId ?? null,
+      sessionId: ctx.sessionId ?? null,
+      toolName,
+      count: repeat.count,
+      severity: repeat.severity,
+    },
+    repeat.severity === "terminate"
+      ? "Repeated identical tool call hit the ceiling; stopping the run"
+      : "Skipping repeated identical tool call; nudging the model",
+  );
+  span.setAttribute(ATTR_MCP_IS_ERROR_RESULT, false);
+  reportToolMetrics({
+    toolName,
+    agentId: ctx.agentId,
+    agentName: ctx.agentName,
+    startTime,
+    isError: false,
+  });
+  return buildRepeatedCallNudge(toolName, repeat.count, repeat.severity);
 }
 
 /** Max chars of tool output passed to a PostToolUse hook payload. */
@@ -1351,7 +1436,6 @@ function normalizeJsonSchema(schema: unknown): JSONSchema7 {
     additionalProperties: false,
   };
 
-  // If schema is missing or invalid, return a minimal valid schema
   if (!isRecord(schema)) {
     return fallbackSchema;
   }
@@ -1387,7 +1471,6 @@ function addAdditionalPropertiesFalse(
       result.additionalProperties = false;
     }
 
-    // Recurse into properties
     if (isRecord(result.properties)) {
       const newProps: Record<string, unknown> = {};
       for (const [key, value] of Object.entries(result.properties)) {
@@ -1399,7 +1482,6 @@ function addAdditionalPropertiesFalse(
     }
   }
 
-  // Recurse into array items
   if (result.type === "array" && isRecord(result.items)) {
     result.items = addAdditionalPropertiesFalse(result.items);
   }

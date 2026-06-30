@@ -2,8 +2,13 @@
 
 import {
   type ChatSkillMetadata,
+  type ContextWindowBreakdown,
+  chatUploadRejectionReason,
   E2eTestId,
   getAcceptedFileTypes,
+  getMediaType,
+  getModelReadableMimeTypes,
+  INLINE_TEXT_MAX_BYTES,
   supportsFileUploads,
 } from "@archestra/shared";
 import type { ChatStatus } from "ai";
@@ -30,10 +35,14 @@ import {
 } from "@/components/ai-elements/prompt-input";
 import { PlaywrightInstallInline } from "@/components/chat/playwright-install-dialog";
 import { SensitiveDataConfirmDialog } from "@/components/chat/sensitive-data-confirm-dialog";
+import { useProfile } from "@/lib/agent.query";
 import { useHasPermissions } from "@/lib/auth/auth.query";
 import { useConversation, useToggleHooksDebug } from "@/lib/chat/chat.query";
 import { useChatPlaceholder } from "@/lib/chat/chat-placeholder.hook";
-import { conversationStorageKeys } from "@/lib/chat/chat-utils";
+import {
+  chatDraftStorageKey,
+  migrateLegacyNewChatDraft,
+} from "@/lib/chat/chat-utils";
 import { useFeature } from "@/lib/config/config.query";
 import { useOrganization } from "@/lib/organization.query";
 import { scanText } from "@/lib/sensitive-data";
@@ -53,19 +62,41 @@ import {
 
 const CHAT_ATTACHMENT_MAX_BYTES = 50 * 1024 * 1024;
 const CHAT_ATTACHMENT_MAX_MB = CHAT_ATTACHMENT_MAX_BYTES / (1024 * 1024);
+// Fallback sandbox artifact limit when /api/config has not loaded yet (mirrors
+// the backend default). Only consulted when a sandbox is available.
+const DEFAULT_SANDBOX_ARTIFACT_BYTES = 16 * 1024 * 1024;
+
+function formatBytes(bytes: number): string {
+  return bytes >= 1024 * 1024
+    ? `${Math.round(bytes / (1024 * 1024))} MB`
+    : `${Math.round(bytes / 1024)} KB`;
+}
 
 export interface ArchestraPromptInputProps
   extends Omit<ChatPromptInputToolsProps, "textareaRef"> {
+  /**
+   * Handle a submit. The textarea and the saved draft are cleared only when
+   * this resolves/returns without throwing. Throw (or reject) to reject the
+   * submit and keep both the typed text and its draft.
+   */
   onSubmit: (
     message: PromptInputMessage,
     e: FormEvent<HTMLFormElement>,
     options?: { skill?: ChatSkillMetadata },
-  ) => void;
+  ) => void | Promise<void>;
   status: ChatStatus;
   // Tools integration props
   agentId: string;
   // Ref for autofocus
   textareaRef?: React.RefObject<HTMLTextAreaElement | null>;
+  /** Per-category breakdown of the assembled request (for context usage panel) */
+  contextWindow?: ContextWindowBreakdown | null;
+  /** Most recent compaction result, surfaced as a marker in the context panel */
+  lastCompaction?: {
+    originalTokenEstimate?: number;
+    compactedTokenEstimate?: number;
+    trigger?: "auto" | "manual";
+  } | null;
   /** Disable the submit button (e.g., when Playwright setup overlay is visible) */
   submitDisabled?: boolean;
   /** Disable chat input while context compaction is running */
@@ -109,6 +140,8 @@ const PromptInputContent = ({
   tokensUsed = 0,
   cachedTokens,
   maxContextLength,
+  contextWindow,
+  lastCompaction,
   inputModalities,
   agentLlmApiKeyId,
   submitDisabled = false,
@@ -120,8 +153,12 @@ const PromptInputContent = ({
   onAgentChange,
   modelSource,
   onResetModelOverride,
+  agentRequiresPerUserConnect,
+  agentModelDisplayName,
+  sandboxAvailable,
 }: Omit<ArchestraPromptInputProps, "onSubmit"> & {
   onSubmit: ArchestraPromptInputProps["onSubmit"];
+  sandboxAvailable: boolean;
 }) => {
   const internalTextareaRef = useRef<HTMLTextAreaElement>(null);
   const textareaRef = externalTextareaRef ?? internalTextareaRef;
@@ -132,10 +169,16 @@ const PromptInputContent = ({
     string | null
   >(null);
 
-  // Derive file upload capabilities from model input modalities
+  // Derive file upload capabilities from model input modalities. When the agent
+  // has a sandbox available, any file type is allowed (it is staged for
+  // run_command), so uploads are offered even for a non-multimodal model and the
+  // OS picker is unrestricted.
   const showFileUploadButton =
-    allowFileUploads && supportsFileUploads(inputModalities);
-  const acceptedFileTypes = getAcceptedFileTypes(inputModalities);
+    allowFileUploads &&
+    (supportsFileUploads(inputModalities) || sandboxAvailable);
+  const acceptedFileTypes = sandboxAvailable
+    ? undefined
+    : getAcceptedFileTypes(inputModalities);
 
   // Chat placeholders from organization settings
   const { data: orgData } = useOrganization();
@@ -191,11 +234,19 @@ const PromptInputContent = ({
     skillCommands,
   ]);
 
-  const storageKey = conversationId
-    ? conversationStorageKeys(conversationId).draft
-    : `archestra_chat_draft_new_${agentId}`;
+  // Keyed by conversation only — NOT by agentId. Keying the new-chat draft by
+  // agent made the restore effect below re-run on every agent switch and clear
+  // the input, dropping the user's in-progress prompt.
+  const storageKey = chatDraftStorageKey(conversationId);
 
   const isRestored = useRef(false);
+
+  // One-time migration of pre-upgrade per-agent new-chat drafts to the shared
+  // key, so an unsent draft written before this change is not dropped. Runs
+  // before the restore effect below so the restore reads the migrated value.
+  useEffect(() => {
+    migrateLegacyNewChatDraft(localStorage);
+  }, []);
 
   // Restore draft on mount or conversation change
   useEffect(() => {
@@ -384,14 +435,24 @@ const PromptInputContent = ({
     reject: (reason?: unknown) => void;
   } | null>(null);
 
+  // The draft is cleared only once the consumer accepts the submit (a
+  // non-throwing, non-rejecting return). A rejecting consumer (e.g. the
+  // new-chat composer refusing a text+attachment submit) keeps the draft and,
+  // because the throw/rejection propagates, ai-elements also keeps the textarea
+  // — so the typed prompt survives. Mirrors the textarea-clear timing.
   const dispatchSubmit = useCallback(
     (
       outgoing: PromptInputMessage,
       e: FormEvent<HTMLFormElement>,
       options?: { skill: ChatSkillMetadata },
-    ) => {
+    ): void | Promise<void> => {
+      const result = onSubmit(outgoing, e, options);
+      if (result instanceof Promise) {
+        return result.then(() => {
+          localStorage.removeItem(storageKey);
+        });
+      }
       localStorage.removeItem(storageKey);
-      onSubmit(outgoing, e, options);
     },
     [onSubmit, storageKey],
   );
@@ -442,7 +503,7 @@ const PromptInputContent = ({
         }
       }
 
-      dispatchSubmit(outgoing, e, options);
+      return dispatchSubmit(outgoing, e, options);
     },
     [
       canDebug,
@@ -459,9 +520,20 @@ const PromptInputContent = ({
     const pending = pendingSubmissionRef.current;
     pendingSubmissionRef.current = null;
     setSensitiveDataDialogOpen(false);
-    if (pending) {
-      dispatchSubmit(pending.outgoing, pending.e, pending.options);
-      pending.resolve();
+    if (!pending) return;
+    try {
+      const result = dispatchSubmit(
+        pending.outgoing,
+        pending.e,
+        pending.options,
+      );
+      if (result instanceof Promise) {
+        result.then(pending.resolve, pending.reject);
+      } else {
+        pending.resolve();
+      }
+    } catch (err) {
+      pending.reject(err);
     }
   }, [dispatchSubmit]);
 
@@ -596,6 +668,7 @@ const PromptInputContent = ({
             onApiKeyChange={onApiKeyChange}
             onProviderChange={onProviderChange}
             allowFileUploads={allowFileUploads}
+            sandboxAvailable={sandboxAvailable}
             isModelsLoading={isModelsLoading}
             tokensUsed={tokensUsed}
             cachedTokens={cachedTokens}
@@ -607,7 +680,11 @@ const PromptInputContent = ({
             onAgentChange={onAgentChange}
             modelSource={modelSource}
             onResetModelOverride={onResetModelOverride}
+            agentRequiresPerUserConnect={agentRequiresPerUserConnect}
+            agentModelDisplayName={agentModelDisplayName}
             textareaRef={textareaRef}
+            contextWindow={contextWindow}
+            lastCompaction={lastCompaction}
           />
           <div className="flex items-center gap-2">
             <PromptInputSpeechButton
@@ -649,6 +726,8 @@ const ArchestraPromptInput = ({
   tokensUsed = 0,
   cachedTokens,
   maxContextLength,
+  contextWindow,
+  lastCompaction,
   inputModalities,
   agentLlmApiKeyId,
   submitDisabled,
@@ -660,10 +739,42 @@ const ArchestraPromptInput = ({
   onAgentChange,
   modelSource,
   onResetModelOverride,
+  agentRequiresPerUserConnect,
+  agentModelDisplayName,
 }: ArchestraPromptInputProps) => {
+  const { data: activeAgent } = useProfile(agentId);
+  const sandboxAvailable = activeAgent?.sandboxAvailable ?? false;
+  const sandboxByteLimit =
+    useFeature("sandboxArtifactBytesLimit") ?? DEFAULT_SANDBOX_ARTIFACT_BYTES;
+
+  // Per-file policy mirroring the backend ingest gate (which is authoritative).
+  // Returns a friendly reason to drop the file, or null to accept it.
+  const validateFile = useCallback(
+    (file: File): string | null => {
+      const reason = chatUploadRejectionReason({
+        mimeType: getMediaType(file),
+        byteLength: file.size,
+        ingestibleMimeTypes: getModelReadableMimeTypes(inputModalities),
+        sandboxAvailable,
+        sandboxByteLimit,
+      });
+      switch (reason) {
+        case null:
+          return null;
+        case "text_too_large":
+          return `"${file.name}" is too large to include as text (max ${formatBytes(INLINE_TEXT_MAX_BYTES)}). Enable the sandbox to work with larger files.`;
+        case "too_large_for_sandbox":
+          return `"${file.name}" exceeds the maximum size of ${formatBytes(sandboxByteLimit)}.`;
+        case "unsupported_type":
+          return `This model can't read "${file.name}". Enable the sandbox to use any file type.`;
+      }
+    },
+    [inputModalities, sandboxAvailable, sandboxByteLimit],
+  );
+
   const handleProviderFileError = useCallback(
     (err: {
-      code: "max_files" | "max_file_size" | "accept";
+      code: "max_files" | "max_file_size" | "accept" | "rejected";
       message: string;
     }) => {
       if (err.code === "max_file_size") {
@@ -672,6 +783,10 @@ const ArchestraPromptInput = ({
         );
       } else if (err.code === "max_files") {
         toast.error("Too many files attached.");
+      } else if (err.code === "rejected") {
+        // Policy rejection (unsupported type / too large to inline). Gentle,
+        // not an error toast — the message already explains the next step.
+        toast(err.message);
       }
     },
     [],
@@ -681,6 +796,7 @@ const ArchestraPromptInput = ({
     <div className="flex size-full flex-col justify-end">
       <PromptInputProvider
         maxFileSize={CHAT_ATTACHMENT_MAX_BYTES}
+        validateFile={validateFile}
         onError={handleProviderFileError}
       >
         <PromptInputContent
@@ -701,6 +817,8 @@ const ArchestraPromptInput = ({
           tokensUsed={tokensUsed}
           cachedTokens={cachedTokens}
           maxContextLength={maxContextLength}
+          contextWindow={contextWindow}
+          lastCompaction={lastCompaction}
           inputModalities={inputModalities}
           agentLlmApiKeyId={agentLlmApiKeyId}
           submitDisabled={submitDisabled}
@@ -712,6 +830,9 @@ const ArchestraPromptInput = ({
           onAgentChange={onAgentChange}
           modelSource={modelSource}
           onResetModelOverride={onResetModelOverride}
+          agentRequiresPerUserConnect={agentRequiresPerUserConnect}
+          agentModelDisplayName={agentModelDisplayName}
+          sandboxAvailable={sandboxAvailable}
         />
       </PromptInputProvider>
     </div>

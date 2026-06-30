@@ -1,12 +1,12 @@
 import { archestraApiSdk, type archestraApiTypes } from "@archestra/shared";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { handleApiError } from "@/lib/utils";
+import { handleApiError, throwOnApiError } from "@/lib/utils";
 
 const {
   getApps,
   getApp,
-  getAppTemplates,
+  getExternalApp,
   getAppVersions,
   getAppTools,
   createApp,
@@ -14,6 +14,7 @@ const {
   deleteApp,
   assignToolToApp,
   unassignToolFromApp,
+  openAppInChat,
 } = archestraApiSdk;
 
 type AppsQuery = NonNullable<archestraApiTypes.GetAppsData["query"]>;
@@ -21,18 +22,35 @@ type AppsParams = Pick<AppsQuery, "limit" | "offset" | "search">;
 
 // ===== Query hooks =====
 
-export function useApps(params: AppsParams, options?: { enabled?: boolean }) {
+export function useApps(
+  params: AppsParams,
+  options?: { enabled?: boolean; toastOnError?: boolean },
+) {
+  const toastOnError = options?.toastOnError;
   return useQuery({
     queryKey: ["apps", "paginated", params],
     enabled: options?.enabled ?? true,
     placeholderData: (previousData) => previousData,
     queryFn: async () => {
       const { data, error } = await getApps({ query: params });
-      if (error) {
-        handleApiError(error);
-        return null;
-      }
+      throwOnApiError(error, { toastOnError });
       return data;
+    },
+  });
+}
+
+// Resolves an external UI-providing app by catalog id: its UI resource plus the
+// caller's accessible installs and default install for the run-page selector.
+export function useExternalApp(catalogId: string | null) {
+  return useQuery({
+    queryKey: ["apps", "external", catalogId],
+    enabled: !!catalogId,
+    queryFn: async () => {
+      const { data, error } = await getExternalApp({
+        path: { catalogId: catalogId as string },
+      });
+      throwOnApiError(error, { allowNotFound: true });
+      return data ?? null;
     },
   });
 }
@@ -45,27 +63,8 @@ export function useApp(appId: string | null) {
       const { data, error } = await getApp({
         path: { appId: appId as string },
       });
-      if (error) {
-        handleApiError(error);
-        return null;
-      }
-      return data;
-    },
-  });
-}
-
-export function useAppTemplates(options?: { enabled?: boolean }) {
-  return useQuery({
-    queryKey: ["apps", "templates"],
-    enabled: options?.enabled ?? true,
-    staleTime: Infinity,
-    queryFn: async () => {
-      const { data, error } = await getAppTemplates();
-      if (error) {
-        handleApiError(error);
-        return [];
-      }
-      return data;
+      throwOnApiError(error, { allowNotFound: true });
+      return data ?? null;
     },
   });
 }
@@ -78,11 +77,8 @@ export function useAppVersions(appId: string | null) {
       const { data, error } = await getAppVersions({
         path: { appId: appId as string },
       });
-      if (error) {
-        handleApiError(error);
-        return [];
-      }
-      return data;
+      throwOnApiError(error, { allowNotFound: true });
+      return data ?? [];
     },
   });
 }
@@ -95,11 +91,8 @@ export function useAppTools(appId: string | null) {
       const { data, error } = await getAppTools({
         path: { appId: appId as string },
       });
-      if (error) {
-        handleApiError(error);
-        return [];
-      }
-      return data;
+      throwOnApiError(error, { allowNotFound: true });
+      return data ?? [];
     },
   });
 }
@@ -125,6 +118,22 @@ export function useCreateApp() {
   });
 }
 
+// Opens an existing app in chat: the backend creates a conversation with the app
+// already rendered and returns its id to navigate to. No cache to invalidate —
+// the caller navigates to `/chat/<conversationId>` on success.
+export function useOpenAppInChat() {
+  return useMutation({
+    mutationFn: async (appId: string) => {
+      const { data, error } = await openAppInChat({ path: { appId } });
+      if (error) {
+        handleApiError(error);
+        return null;
+      }
+      return data;
+    },
+  });
+}
+
 export function useUpdateApp() {
   const queryClient = useQueryClient();
   return useMutation({
@@ -146,6 +155,9 @@ export function useUpdateApp() {
       if (!data) return;
       queryClient.invalidateQueries({ queryKey: ["apps"] });
       queryClient.invalidateQueries({ queryKey: ["apps", variables.appId] });
+      // Visibility/environment edits write through to the app's backing catalog,
+      // which drives the MCP registry card — refresh it too.
+      queryClient.invalidateQueries({ queryKey: ["mcp-catalog"] });
       toast.success("App updated");
     },
   });
@@ -165,6 +177,8 @@ export function useDeleteApp() {
     onSuccess: (data) => {
       if (!data) return;
       queryClient.invalidateQueries({ queryKey: ["apps"] });
+      // Deleting an app tears down its backing catalog — refresh the registry.
+      queryClient.invalidateQueries({ queryKey: ["mcp-catalog"] });
       toast.success("App deleted");
     },
   });
